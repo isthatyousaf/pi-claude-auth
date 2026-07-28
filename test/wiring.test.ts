@@ -105,9 +105,12 @@ describe("extension wiring (Pi owns the OAuth lifecycle)", () => {
 					},
 				},
 			},
+			sessionManager: { getBranch: () => [] },
 			ui: { custom: async () => {} },
 		};
-		await spy.handlers.session_start?.[0]?.({ reason: "startup" }, ctx);
+		for (const handler of spy.handlers.session_start ?? []) {
+			await handler({ reason: "startup" }, ctx);
+		}
 		expect(setCalled).toBe(false);
 	});
 });

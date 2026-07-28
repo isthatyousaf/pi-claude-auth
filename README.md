@@ -75,9 +75,9 @@ Network timeouts and generic proxy errors fail the wording gate. Other model fam
 
 **Continue with Claude Opus 4.8** waits until Pi has persisted the refusal, switches the active model, and sends a hidden custom message containing exactly `continue`. The fallback model sees the existing transcript and completed tool work, but the continuation message is not rendered to the user. Claude Opus 4.8 remains selected for later turns.
 
-**Edit and retry** branches the session tree directly at `agent_end` to the safe point immediately before the event that triggered the refusal — skipping both that trigger event and the refusal itself. No command staging or extra keypress is needed. The user's in-progress editor draft is restored. The `context` event rebuilds the message list from the session tree so the model sees the correct state. Completed work before the trigger remains on the active branch; the refused path stays available in `/tree`.
+**Edit and retry** branches the session tree directly at `agent_end` to the safe point immediately before the event that triggered the refusal — skipping both that trigger event and the refusal itself. No command staging or extra keypress is needed. The user's in-progress editor draft is restored. A hidden extension entry makes the selected branch durable across session reopen, and every later `context` event rebuilds provider input from that active branch until Pi performs supported tree navigation or compaction. Reload restores that repair state from the marker. Completed work before the trigger remains on the active branch; the refused path stays available in `/tree`.
 
-**Known limitation:** The TUI transcript does not refresh after branching because `sessionManager.branch()` (cast from the read-only type) does not rebuild `agent.state.messages` or emit `session_tree`. `navigateTree()` — which does both — is only available on `ExtensionCommandContext`, not the `ExtensionContext` that event handlers receive. See the handoff document for the full investigation.
+**Known limitation:** The visible TUI transcript does not refresh after direct branching because `sessionManager.branch()` (cast from the read-only type) cannot rebuild Pi's private `agent.state.messages` or chat component tree. `navigateTree()` — which synchronizes both — is only available on `ExtensionCommandContext`, not the `ExtensionContext` that event handlers receive. The model still receives the correct active-branch context. Manual `/tree` navigation, successful compaction, reload, or session replacement rebuilds the visible transcript.
 
 Escape stops and leaves the refusal as the active leaf.
 
@@ -86,6 +86,40 @@ Set `PI_CLAUDE_AUTH_REFUSAL_MODE=auto` to skip the menu and always continue with
 #### Limits
 
 The extension can recover only after Pi finishes the refusal and emits `message_end`. If the stream hangs first, there is no finalized refusal entry to handle.
+
+Pi does not expose queue clearing to event handlers. Steering or follow-up messages already queued when the refusal finishes may still run automatically after the branch.
+
+Edit and retry rewinds Pi's conversation/session context only. It does not undo filesystem changes, shell commands, network calls, or other external side effects already produced by the abandoned tool turn.
+
+#### Deterministic mid-work refusal demo
+
+From the repository root, use the fake Anthropic provider to exercise the critical multi-turn path without making an external model request:
+
+```bash
+PI_OFFLINE=1 \
+PI_CLAUDE_AUTH_REFUSAL_MODE=ask \
+pi --no-extensions \
+  -e ./src/index.ts \
+  -e ./test/fixtures/refusal-simulator.ts \
+  --model anthropic/claude-fable-5 \
+  --api-key refusal-simulator-local-only \
+  --thinking high \
+  --session-dir "/tmp/pi-refusal-demo-$(date +%s)"
+```
+
+Enter any prompt. The simulator produces this sequence:
+
+1. Fable thinking + assistant text + baseline tool A
+2. The completed result from tool A
+3. More Fable thinking + assistant text + tool B
+4. The completed result from tool B
+5. More Fable thinking + assistant text + a separate tool C
+6. The completed result from tool C
+7. A classifier refusal
+
+Choosing **Edit and retry** keeps everything through tool B's completed result, then abandons the assistant turn that called tool C, tool C's result, and the refusal. Enter a revised prompt to see Fable continue from immediately before tool C. Choosing **Continue** switches to the simulated Opus 4.8 and sends the hidden `continue` message. Run `/reload` after Edit to repaint the transcript from the active branch.
+
+If B and C are emitted together inside one assistant message, Pi has no branch boundary between them. That assistant message and all of its tool results form one atomic batch, so Edit must discard the whole batch rather than leave an orphaned tool call or result.
 
 ### `/login anthropic`
 

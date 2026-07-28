@@ -7,6 +7,7 @@ import { showRefusalMenu } from "./refusal-ui.ts";
 
 const OPUS_FALLBACK_MODEL_ID = "claude-opus-4-8";
 const CONTINUE_MESSAGE_TYPE = "claude-refusal-continue";
+const BRANCH_ENTRY_TYPE = "claude-refusal-branch";
 
 type RefusalMode = "ask" | "auto";
 
@@ -95,18 +96,19 @@ interface SessionMessageEntry {
 }
 
 /**
- * Compute the branch target that skips both the trigger event and the refusal.
+ * Compute the active leaf that skips both the trigger event and the refusal.
  *
  * - Tool-result trigger: walk back through consecutive tool results to find the
- *   assistant tool-call message that started the batch, then target its parent.
- * - User-message trigger: target the user message itself so Pi rewinds to its
- *   parent and restores its text for editing.
- * - Anything else: target the trigger's parent.
+ *   assistant tool-call message that started the batch, then keep its parent.
+ * - User-message trigger: keep its parent so the triggering prompt is removed.
+ * - Anything else: keep the trigger's parent.
+ *
+ * A null result means the trigger was the root entry and the leaf must be reset.
  */
 export function computeBranchTarget(
 	sessionManager: ExtensionContext["sessionManager"],
 	triggerId: string,
-): string {
+): string | null {
 	const trigger = sessionManager.getEntry(triggerId) as SessionMessageEntry | undefined;
 	if (!trigger || trigger.type !== "message") return triggerId;
 
@@ -117,28 +119,36 @@ export function computeBranchTarget(
 			if (!entry || entry.type !== "message" || entry.message.role !== "toolResult")
 				break;
 			const parentId = entry.parentId;
-			if (!parentId) break;
+			if (!parentId) return null;
 			const parent = sessionManager.getEntry(parentId) as SessionMessageEntry | undefined;
 			if (parent?.type === "message" && parent.message.role === "toolResult") {
 				currentId = parentId;
 				continue;
 			}
-			return parent?.parentId ?? parentId;
+			return parent?.type === "message" ? parent.parentId : parentId;
 		}
 	}
 
-	if (trigger.message.role === "user") {
-		return triggerId;
-	}
+	return trigger.parentId;
+}
 
-	return trigger.parentId ?? triggerId;
+function hasRefusalBranchMarker(
+	sessionManager: ExtensionContext["sessionManager"],
+): boolean {
+	return sessionManager
+		.getBranch()
+		.some(
+			(entry) =>
+				entry.type === "custom" && entry.customType === BRANCH_ENTRY_TYPE,
+		);
 }
 
 type PendingAction =
 	| { type: "continue"; refusedModelName: string }
 	| {
 			type: "edit";
-			targetId: string;
+			triggerId: string;
+			targetId: string | null;
 			draft: string;
 	  };
 
@@ -146,6 +156,10 @@ export function registerRetryAfterRefusal(pi: ExtensionAPI): void {
 	const state = createRetryAfterRefusalState();
 	let pending: PendingAction | undefined;
 	let needsContextRebuild = false;
+
+	pi.on("session_start", (_event, ctx) => {
+		needsContextRebuild = hasRefusalBranchMarker(ctx.sessionManager);
+	});
 
 	async function continueWithFallback(
 		ctx: ExtensionContext,
@@ -238,6 +252,7 @@ export function registerRetryAfterRefusal(pi: ExtensionAPI): void {
 			state.complete();
 			pending = {
 				type: "edit",
+				triggerId,
 				targetId: computeBranchTarget(ctx.sessionManager, triggerId),
 				draft: ctx.ui.getEditorText(),
 			};
@@ -257,26 +272,35 @@ export function registerRetryAfterRefusal(pi: ExtensionAPI): void {
 			return;
 		}
 
-		// Edit: branch the session tree directly. The refusal has been
-		// persisted as a child of the trigger entry. Branching moves the leaf
-		// to the safe parent, abandoning the trigger event and the refusal to
-		// an alternate branch. The context event below rebuilds the message
-		// list so the model sees the correct state despite
-		// agent.state.messages being stale.
+		// Edit: move the session leaf to the safe parent, then append a hidden
+		// extension entry there. SessionManager persists entries, not leaf moves,
+		// so the marker makes the selected branch survive reopening the session.
+		// The context hook below keeps provider requests on that branch while
+		// Pi's private agent state remains stale.
 		//
-		// KNOWN LIMITATION: sessionManager.branch() moves the persisted leaf
-		// but does NOT rebuild agent.state.messages or emit session_tree, so
-		// the TUI transcript stays stale until the next full render cycle.
-		// navigateTree() (which does both) is only available on
-		// ExtensionCommandContext, not ExtensionContext. See handoff doc for
-		// the full investigation and remaining options.
+		// KNOWN LIMITATION: direct SessionManager mutation cannot rebuild Pi's
+		// visible transcript. It stays stale until a supported tree navigation,
+		// compaction, reload, or session replacement reconstructs the TUI.
 		const sm = ctx.sessionManager as unknown as SessionManager;
 		try {
-			sm.branch(action.targetId);
+			if (action.targetId === null) sm.resetLeaf();
+			else sm.branch(action.targetId);
 		} catch {
 			ctx.ui.notify("Could not branch to the point before the refusal.", "error");
 			state.complete();
 			return;
+		}
+
+		try {
+			pi.appendEntry(BRANCH_ENTRY_TYPE, {
+				triggerId: action.triggerId,
+				targetId: action.targetId,
+			});
+		} catch {
+			ctx.ui.notify(
+				"Branched before the refusal, but could not persist that branch selection.",
+				"warning",
+			);
 		}
 
 		needsContextRebuild = true;
@@ -284,16 +308,20 @@ export function registerRetryAfterRefusal(pi: ExtensionAPI): void {
 		state.complete();
 	});
 
-	// Safety net: after a direct branch, agent.state.messages is stale. The
-	// context event fires before every LLM call and can replace the message
-	// list entirely. We rebuild from the session tree, which has the correct
-	// active branch.
+	// Safety net: direct branching does not mutate agent.state.messages. Rebuild
+	// every provider context from the active session branch until Pi performs an
+	// operation that synchronizes its own state.
 	pi.on("context", async (_event, ctx) => {
 		if (!needsContextRebuild) return undefined;
-		needsContextRebuild = false;
 		const sessionContext = (
 			ctx.sessionManager as unknown as SessionManager
 		).buildSessionContext();
 		return { messages: sessionContext.messages };
 	});
+
+	const markContextSynchronized = () => {
+		needsContextRebuild = false;
+	};
+	pi.on("session_tree", markContextSynchronized);
+	pi.on("session_compact", markContextSynchronized);
 }

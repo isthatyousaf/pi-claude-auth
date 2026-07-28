@@ -1,4 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
 	type ExtensionAPI,
 	SessionManager,
@@ -29,19 +32,24 @@ const fableRefusal = {
 	model: "claude-fable-5",
 	stopReason: "error",
 	errorMessage: "The request was blocked by a safety classifier",
-};
+} as const;
 
 interface HarnessOptions {
 	action?: "continue" | "edit";
 	mode?: "tui" | "rpc" | "json" | "print";
 	refusedModel?: { provider: string; id: string; name: string };
 	editorDraft?: string;
+	session?: SessionManager;
+	trigger?: "toolResult" | "user";
+	initializeSession?: boolean;
+	setupSession?: (session: SessionManager) => void;
 }
 
 function createHarness(options: HarnessOptions = {}) {
 	const handlers: Record<string, Handler[]> = {};
 	const notifications: unknown[] = [];
 	const sentMessages: unknown[] = [];
+	const appendedEntries: unknown[] = [];
 	const editorValues: string[] = [];
 	const selectedModels: unknown[] = [];
 	let customCalls = 0;
@@ -58,37 +66,50 @@ function createHarness(options: HarnessOptions = {}) {
 		name: "Claude Opus 4.8",
 	};
 
-	const session = SessionManager.inMemory();
-	session.appendMessage({
-		role: "user",
-		content: "Do the task",
-		timestamp: Date.now(),
-	});
-	session.appendMessage({
-		role: "assistant",
-		content: [{ type: "toolCall", id: "t1", name: "read", arguments: {} }],
-		api: "anthropic-messages",
-		provider: "anthropic",
-		model: "claude-fable-5",
-		usage: {
-			input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
-			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-		},
-		stopReason: "toolUse",
-		timestamp: Date.now(),
-	});
-	session.appendMessage({
-		role: "toolResult",
-		toolCallId: "t1",
-		toolName: "read",
-		content: [{ type: "text", text: "binary contents" }],
-		isError: false,
-		timestamp: Date.now(),
-	});
+	const session = options.session ?? SessionManager.inMemory();
+	if (options.initializeSession !== false) {
+		if (options.setupSession) {
+			options.setupSession(session);
+		} else {
+			session.appendMessage({
+				role: "user",
+				content: "Do the task",
+				timestamp: Date.now(),
+			});
+			if (options.trigger !== "user") {
+				session.appendMessage({
+					role: "assistant",
+					content: [{ type: "toolCall", id: "t1", name: "read", arguments: {} }],
+					api: "anthropic-messages",
+					provider: "anthropic",
+					model: "claude-fable-5",
+					usage: {
+						input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+					stopReason: "toolUse",
+					timestamp: Date.now(),
+				});
+				session.appendMessage({
+					role: "toolResult",
+					toolCallId: "t1",
+					toolName: "read",
+					content: [{ type: "text", text: "binary contents" }],
+					isError: false,
+					timestamp: Date.now(),
+				});
+			}
+		}
+	}
+	const triggerId = session.getLeafId()!;
 
 	const pi = {
 		on(event: string, handler: Handler) {
 			handlers[event] = [...(handlers[event] ?? []), handler];
+		},
+		appendEntry(customType: string, data: unknown) {
+			appendedEntries.push({ customType, data });
+			session.appendCustomEntry(customType, data);
 		},
 		sendMessage(message: unknown, sendOptions: unknown) {
 			sentMessages.push({ message, options: sendOptions });
@@ -133,6 +154,7 @@ function createHarness(options: HarnessOptions = {}) {
 
 	registerRetryAfterRefusal(pi);
 	return {
+		appendedEntries,
 		ctx,
 		editorValues,
 		fallbackModel,
@@ -141,8 +163,22 @@ function createHarness(options: HarnessOptions = {}) {
 		},
 		handlers,
 		notifications,
+		persistRefusal() {
+			return session.appendMessage({
+				...fableRefusal,
+				content: [],
+				api: "anthropic-messages",
+				usage: {
+					input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				timestamp: Date.now(),
+			});
+		},
 		selectedModels,
 		sentMessages,
+		session,
+		triggerId,
 	};
 }
 
@@ -225,12 +261,13 @@ describe("branch target computation", () => {
 		const session = makeToolBatchSession();
 		const leafId = session.getLeafId()!;
 		const target = computeBranchTarget(session, leafId);
-		const targetEntry = session.getEntry(target);
+		expect(target).not.toBeNull();
+		const targetEntry = session.getEntry(target!);
 		expect(targetEntry?.type).toBe("message");
 		expect((targetEntry as { message: { role: string } }).message.role).toBe("user");
 	});
 
-	it("targets the user message itself when the trigger is a user message", () => {
+	it("targets the parent when the trigger is a user message", () => {
 		const session = SessionManager.inMemory();
 		const userId = session.appendMessage({
 			role: "user",
@@ -238,7 +275,7 @@ describe("branch target computation", () => {
 			timestamp: Date.now(),
 		});
 		const target = computeBranchTarget(session, userId);
-		expect(target).toBe(userId);
+		expect(target).toBeNull();
 	});
 
 	it("walks back through multiple tool results to find the batch start", () => {
@@ -282,7 +319,8 @@ describe("branch target computation", () => {
 		});
 		const leafId = session.getLeafId()!;
 		const target = computeBranchTarget(session, leafId);
-		const targetEntry = session.getEntry(target);
+		expect(target).not.toBeNull();
+		const targetEntry = session.getEntry(target!);
 		expect(targetEntry?.type).toBe("message");
 		expect((targetEntry as { message: { role: string } }).message.role).toBe("user");
 	});
@@ -295,6 +333,7 @@ describe("interactive refusal handling", () => {
 		await harness.handlers.message_end[0]({ message: fableRefusal }, harness.ctx);
 		expect(harness.selectedModels).toEqual([]);
 		expect(harness.sentMessages).toEqual([]);
+		harness.persistRefusal();
 
 		await harness.handlers.agent_end[0]({}, harness.ctx);
 		expect(harness.selectedModels).toEqual([harness.fallbackModel]);
@@ -310,24 +349,266 @@ describe("interactive refusal handling", () => {
 		]);
 	});
 
-	it("branches directly at agent_end and restores the draft", async () => {
+	it("branches directly at agent_end, persists the branch, and restores the draft", async () => {
 		const harness = createHarness({ action: "edit", editorDraft: "steer away" });
 
 		await harness.handlers.message_end[0]({ message: fableRefusal }, harness.ctx);
-
+		harness.persistRefusal();
 		await harness.handlers.agent_end[0]({}, harness.ctx);
 
-		// The session should have branched — active context no longer includes
-		// the tool call, tool result, or refusal
-		const sessionContext = (
-			harness.ctx.sessionManager as unknown as SessionManager
-		).buildSessionContext();
 		expect(
-			sessionContext.messages.map((m: { role: string }) => m.role),
+			harness.session.buildSessionContext().messages.map((message) => message.role),
 		).toEqual(["user"]);
-
-		// Draft restored
+		expect(harness.session.getLeafEntry()).toMatchObject({
+			type: "custom",
+			customType: "claude-refusal-branch",
+			data: { triggerId: harness.triggerId },
+		});
+		expect(harness.appendedEntries).toHaveLength(1);
 		expect(harness.editorValues).toEqual(["steer away"]);
+	});
+
+	it("preserves tool B and rolls back the separate tool C turn", async () => {
+		let toolBResultId = "";
+		let toolCAssistantId = "";
+		let toolCResultId = "";
+		const harness = createHarness({
+			action: "edit",
+			editorDraft: "change course before tool C",
+			setupSession(session) {
+				session.appendMessage({
+					role: "user",
+					content: "Investigate the failing deployment",
+					timestamp: Date.now(),
+				});
+				session.appendMessage({
+					role: "assistant",
+					content: [
+						{ type: "thinking", thinking: "Inspect the baseline configuration first." },
+						{ type: "text", text: "I found an earlier lead worth preserving." },
+						{
+							type: "toolCall",
+							id: "baseline-read",
+							name: "read",
+							arguments: { path: "baseline.txt" },
+						},
+					],
+					api: "anthropic-messages",
+					provider: "anthropic",
+					model: "claude-fable-5",
+					usage: {
+						input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+					stopReason: "toolUse",
+					timestamp: Date.now(),
+				});
+				session.appendMessage({
+					role: "toolResult",
+					toolCallId: "baseline-read",
+					toolName: "read",
+					content: [{ type: "text", text: "baseline configuration" }],
+					isError: false,
+					timestamp: Date.now(),
+				});
+				session.appendMessage({
+					role: "assistant",
+					content: [
+						{ type: "thinking", thinking: "Check the deployment logs next." },
+						{ type: "text", text: "The baseline is useful; I will verify it against the logs." },
+						{
+							type: "toolCall",
+							id: "log-scan",
+							name: "bash",
+							arguments: { command: "scan logs" },
+						},
+					],
+					api: "anthropic-messages",
+					provider: "anthropic",
+					model: "claude-fable-5",
+					usage: {
+						input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+					stopReason: "toolUse",
+					timestamp: Date.now(),
+				});
+				toolBResultId = session.appendMessage({
+					role: "toolResult",
+					toolCallId: "log-scan",
+					toolName: "bash",
+					content: [{ type: "text", text: "log scan output" }],
+					isError: false,
+					timestamp: Date.now(),
+				});
+				toolCAssistantId = session.appendMessage({
+					role: "assistant",
+					content: [
+						{ type: "thinking", thinking: "One final artifact check may explain the failure." },
+						{ type: "text", text: "I will inspect the deployed artifact now." },
+						{
+							type: "toolCall",
+							id: "artifact-read",
+							name: "read",
+							arguments: { path: "artifact.txt" },
+						},
+					],
+					api: "anthropic-messages",
+					provider: "anthropic",
+					model: "claude-fable-5",
+					usage: {
+						input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+					stopReason: "toolUse",
+					timestamp: Date.now(),
+				});
+				toolCResultId = session.appendMessage({
+					role: "toolResult",
+					toolCallId: "artifact-read",
+					toolName: "read",
+					content: [{ type: "text", text: "artifact contents" }],
+					isError: false,
+					timestamp: Date.now(),
+				});
+			},
+		});
+
+		await harness.handlers.message_end[0]({ message: fableRefusal }, harness.ctx);
+		const refusalId = harness.persistRefusal();
+		await harness.handlers.agent_end[0]({}, harness.ctx);
+
+		const activeBranchIds = harness.session.getBranch().map((entry) => entry.id);
+		expect(activeBranchIds).toContain(toolBResultId);
+		expect(activeBranchIds).not.toContain(toolCAssistantId);
+		expect(activeBranchIds).not.toContain(toolCResultId);
+		expect(activeBranchIds).not.toContain(refusalId);
+
+		const activeContext = harness.session.buildSessionContext().messages;
+		expect(activeContext.map((message) => message.role)).toEqual([
+			"user",
+			"assistant",
+			"toolResult",
+			"assistant",
+			"toolResult",
+		]);
+		const activeToolCallIds = activeContext.flatMap((message) =>
+			message.role === "assistant"
+				? message.content
+						.filter((content) => content.type === "toolCall")
+						.map((content) => content.id)
+				: [],
+		);
+		const activeToolResultIds = activeContext.flatMap((message) =>
+			message.role === "toolResult" ? [message.toolCallId] : [],
+		);
+		expect(activeToolCallIds).toEqual(["baseline-read", "log-scan"]);
+		expect(activeToolResultIds).toEqual(activeToolCallIds);
+		expect(harness.session.getLeafEntry()).toMatchObject({
+			type: "custom",
+			parentId: toolBResultId,
+			customType: "claude-refusal-branch",
+		});
+		expect(harness.editorValues).toEqual(["change course before tool C"]);
+
+		harness.session.appendMessage({
+			role: "user",
+			content: "Use the completed log scan and avoid tool C",
+			timestamp: Date.now(),
+		});
+		const nextProviderContext = (await harness.handlers.context[0]({}, harness.ctx)) as {
+			messages: Array<{ role: string }>;
+		};
+		expect(nextProviderContext.messages.map((message) => message.role)).toEqual([
+			"user",
+			"assistant",
+			"toolResult",
+			"assistant",
+			"toolResult",
+			"user",
+		]);
+	});
+
+	it("removes a root user trigger instead of keeping it on the active branch", async () => {
+		const harness = createHarness({ action: "edit", trigger: "user" });
+
+		await harness.handlers.message_end[0]({ message: fableRefusal }, harness.ctx);
+		harness.persistRefusal();
+		await harness.handlers.agent_end[0]({}, harness.ctx);
+
+		expect(harness.session.buildSessionContext().messages).toEqual([]);
+		expect(harness.session.getLeafEntry()).toMatchObject({
+			type: "custom",
+			parentId: null,
+			customType: "claude-refusal-branch",
+		});
+	});
+
+	it("rebuilds every later provider context until Pi performs supported tree navigation", async () => {
+		const harness = createHarness({ action: "edit" });
+		await harness.handlers.message_end[0]({ message: fableRefusal }, harness.ctx);
+		harness.persistRefusal();
+		await harness.handlers.agent_end[0]({}, harness.ctx);
+
+		const first = (await harness.handlers.context[0]({}, harness.ctx)) as {
+			messages: Array<{ role: string }>;
+		};
+		expect(first.messages.map((message) => message.role)).toEqual(["user"]);
+
+		harness.session.appendMessage({
+			role: "user",
+			content: "Try a safer approach",
+			timestamp: Date.now(),
+		});
+		const second = (await harness.handlers.context[0]({}, harness.ctx)) as {
+			messages: Array<{ role: string }>;
+		};
+		expect(second.messages.map((message) => message.role)).toEqual([
+			"user",
+			"user",
+		]);
+
+		await harness.handlers.session_tree[0]({}, harness.ctx);
+		expect(await harness.handlers.context[0]({}, harness.ctx)).toBeUndefined();
+	});
+
+	it("restores context repair after the extension reloads", async () => {
+		const first = createHarness({ action: "edit" });
+		await first.handlers.message_end[0]({ message: fableRefusal }, first.ctx);
+		first.persistRefusal();
+		await first.handlers.agent_end[0]({}, first.ctx);
+
+		const reloaded = createHarness({
+			session: first.session,
+			initializeSession: false,
+		});
+		await reloaded.handlers.session_start[0]({ reason: "reload" }, reloaded.ctx);
+		const context = (await reloaded.handlers.context[0]({}, reloaded.ctx)) as {
+			messages: Array<{ role: string }>;
+		};
+		expect(context.messages.map((message) => message.role)).toEqual(["user"]);
+	});
+
+	it("reopens on the selected branch instead of the abandoned refusal", async () => {
+		const sessionDir = mkdtempSync(join(tmpdir(), "pi-claude-auth-refusal-"));
+		try {
+			const session = SessionManager.create("/tmp/refusal-test", sessionDir);
+			const harness = createHarness({ action: "edit", session });
+			await harness.handlers.message_end[0]({ message: fableRefusal }, harness.ctx);
+			harness.persistRefusal();
+			await harness.handlers.agent_end[0]({}, harness.ctx);
+
+			const reopened = SessionManager.open(session.getSessionFile()!, sessionDir);
+			expect(
+				reopened.buildSessionContext().messages.map((message) => message.role),
+			).toEqual(["user"]);
+			expect(reopened.getLeafEntry()).toMatchObject({
+				type: "custom",
+				customType: "claude-refusal-branch",
+			});
+		} finally {
+			rmSync(sessionDir, { recursive: true, force: true });
+		}
 	});
 
 	it("leaves the refused branch unchanged when the menu is cancelled", async () => {
@@ -345,6 +626,7 @@ describe("automatic and non-interactive handling", () => {
 		await harness.handlers.message_end[0]({ message: fableRefusal }, harness.ctx);
 		expect(harness.customCalls).toBe(0);
 		expect(harness.sentMessages).toEqual([]);
+		harness.persistRefusal();
 		await harness.handlers.agent_end[0]({}, harness.ctx);
 		expect(harness.sentMessages).toHaveLength(1);
 	});
