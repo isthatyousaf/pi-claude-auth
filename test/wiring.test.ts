@@ -14,6 +14,10 @@ interface SpyPi {
 
 function makeSpyPi(): SpyPi & {
 	registerProvider(name: string, config: Record<string, unknown>): void;
+	registerCommand(name: string, options: unknown): void;
+	sendMessage(): void;
+	sendUserMessage(): void;
+	setModel(): Promise<boolean>;
 	on(event: string, handler: Handler): void;
 } {
 	const registerProviderCalls: {
@@ -26,6 +30,12 @@ function makeSpyPi(): SpyPi & {
 		handlers,
 		registerProvider(name, config) {
 			registerProviderCalls.push({ name, config });
+		},
+		registerCommand() {},
+		sendMessage() {},
+		sendUserMessage() {},
+		async setModel() {
+			return true;
 		},
 		on(event, handler) {
 			handlers[event] ??= [];

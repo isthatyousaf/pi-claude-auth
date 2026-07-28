@@ -111,7 +111,8 @@ async function showVersionAlert(
  * - Injects the `x-anthropic-billing-header` system block on every request and
  *   relocates pi's own system prompt into the first user message (Anthropic
  *   rejects third-party system prompts alongside the Claude Code identity).
- * - Retries Anthropic Fable/Mythos classifier refusals on Opus 4.8.
+ * - Handles Anthropic Fable 5 and Opus 5 classifier refusals with an
+ *   interactive branch-or-continue workflow.
  *
  * It deliberately does NOT register a custom `oauth` lifecycle: doing so would
  * overwrite pi's built-in `anthropic` OAuth provider and break `/login`. Run

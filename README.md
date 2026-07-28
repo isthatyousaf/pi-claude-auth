@@ -51,13 +51,13 @@ The version suffix is computed per request from the current Claude Code algorith
 
 If startup cannot reach npm and has no cache, Pi falls back to a built-in version and shows a red alert. If it falls back to a cached version, it shows a yellow alert. Both dismiss with Enter or Escape. Offline runs stay silent.
 
-### Fable and Mythos refusal handling
+### Fable 5 and Opus 5 refusal handling
 
-Claude Fable 5 and Mythos 5 route some requests through safety classifiers. When a classifier blocks a turn, Anthropic returns the refusal as a finished message with `stop_reason: "refusal"` and an explanation. Pi maps that to `stopReason: "error"` with the explanation in `errorMessage` and leaves it there. The original Pi user sees a red error and a dead turn.
+Claude Fable 5 and Opus 5 route some requests through safety classifiers. When a classifier blocks a turn, Anthropic returns the refusal as a finished message with `stop_reason: "refusal"` and an explanation. Pi maps that to `stopReason: "error"` with the explanation in `errorMessage`.
 
-This extension adds a client-side retry. When a finalized Anthropic Fable or Mythos assistant message looks like a classifier refusal, the extension switches the active model to Claude Opus 4.8, resends the last user message, and switches back to the original model once Opus finishes.
+This extension pauses the TUI when a finalized Anthropic Fable 5 or Opus 5 assistant message looks like a classifier refusal. The user can switch to Claude Opus 4.8 and continue there, or branch to the exact point immediately before the refusal and type new steering instructions with the original model still selected.
 
-This is not Anthropic server-side fallback. Server-side fallback sends one request with a `fallbacks` chain and lets Anthropic pick the model internally, then carries the response back over a single stream. That lives inside the provider and reads protocol fields an extension cannot see. The extension here runs two separate turns and works only with the normalized refusal message Pi already exposes.
+This is not Anthropic server-side fallback. Server-side fallback sends one request with a `fallbacks` chain and lets Anthropic pick the model internally. The extension runs a separate Pi turn using the normalized refusal message Pi exposes.
 
 #### What counts as a refusal
 
@@ -65,25 +65,27 @@ All five conditions must hold on the finalized assistant message:
 
 - role is `assistant`
 - provider is `anthropic`
-- model id contains `claude-fable-5` or `claude-mythos-5`
+- model id contains `claude-fable-5` or `claude-opus-5`
 - `stopReason` is `error`
-- `errorMessage` matches refusal wording (`refus`, `classifier`, `safety`, `usage policy`, `violative`, or `refusals-and-fallback`)
+- `errorMessage` matches refusal wording (`refus`, `classifier`, `safety`, `safeguard`, `usage policy`, `violative`, or `refusals-and-fallback`)
 
-A network timeout fails the wording gate. A generic proxy block fails the wording gate. A refusal on Opus or Sonnet fails the model gate. The Opus retry reply itself fails the model gate, because its model is `claude-opus-4-8`, so the retry cannot retrigger itself.
+Network timeouts and generic proxy errors fail the wording gate. Other model families fail the model gate. The Claude Opus 4.8 continuation also fails the model gate, so it cannot retrigger the workflow.
 
-#### What happens on a refusal
+#### Interactive choices
 
-1. The extension resolves both model display names from the active model or Pi's model registry, falling back to the raw model id.
-2. It switches to Claude Opus 4.8. If the switch fails, it shows a red notice and stops there.
-3. It resends the last user message as a follow-up. No instruction is added telling Opus to bypass anything. Opus sees the original prompt and the Fable refusal that preceded it.
-4. After the Opus turn finishes, the extension switches back to the original model.
-5. The retry guard clears, so the same prompt can be retried again if you re-ask it later.
+**Continue with Claude Opus 4.8** waits until Pi has persisted the refusal, switches the active model, and sends a hidden custom message containing exactly `continue`. The fallback model sees the existing transcript and completed tool work, but the continuation message is not rendered to the user. Claude Opus 4.8 remains selected for later turns.
 
-The restore waits for the Opus turn. The first `agent_end` belongs to the Fable refusal and is skipped. This prevents the extension from restoring to Fable before the queued Opus request runs.
+**Edit and retry** branches the session tree directly at `agent_end` to the safe point immediately before the event that triggered the refusal — skipping both that trigger event and the refusal itself. No command staging or extra keypress is needed. The user's in-progress editor draft is restored. The `context` event rebuilds the message list from the session tree so the model sees the correct state. Completed work before the trigger remains on the active branch; the refused path stays available in `/tree`.
+
+**Known limitation:** The TUI transcript does not refresh after branching because `sessionManager.branch()` (cast from the read-only type) does not rebuild `agent.state.messages` or emit `session_tree`. `navigateTree()` — which does both — is only available on `ExtensionCommandContext`, not the `ExtensionContext` that event handlers receive. See the handoff document for the full investigation.
+
+Escape stops and leaves the refusal as the active leaf.
+
+Set `PI_CLAUDE_AUTH_REFUSAL_MODE=auto` to skip the menu and always continue with Claude Opus 4.8. The default is `ask`. Non-TUI modes stop instead of silently choosing when the mode is `ask`.
 
 #### Limits
 
-The extension recovers only after Pi finishes the refusal. If the stream hangs before Pi emits `message_end`, there is nothing to recover from, because the extension never owns the provider stream.
+The extension can recover only after Pi finishes the refusal and emits `message_end`. If the stream hangs first, there is no finalized refusal entry to handle.
 
 ### `/login anthropic`
 
@@ -97,7 +99,7 @@ The extension recovers only after Pi finishes the refusal. If the stream hangs b
 | `CLAUDE_CODE_ENTRYPOINT` | Override the billing entrypoint mirrored in the user-agent suffix. |
 | `ANTHROPIC_USER_AGENT` | Override the whole user-agent string. |
 | `PI_CLAUDE_AUTH_DEBUG` | Set `1` for opt-in diagnostic logging to `~/.pi/agent/pi-claude-auth-debug.log`. Secrets are redacted before anything is written. |
-| `PI_CLAUDE_AUTH_NO_OPUS_RETRY` | Set `1` to disable the Opus 4.8 retry on Fable/Mythos classifier refusals. The refusal is surfaced as a red notice and the chat stops instead of switching models. |
+| `PI_CLAUDE_AUTH_REFUSAL_MODE` | Refusal policy for Fable 5 and Opus 5: `ask` (default) or `auto`. |
 
 ## Credits
 
