@@ -244,13 +244,37 @@ describe("refusal detection", () => {
 		).toBe(true);
 	});
 
+	it("handles the wording Anthropic and Pi actually send", () => {
+		// Anthropic's documented explanation text, which never says "refusal".
+		for (const category of ["cyber", "biological", "frontier model"]) {
+			expect(
+				shouldHandleRefusal({
+					...fableRefusal,
+					errorMessage: `This request was declined because it could enable ${category} harm.`,
+				}),
+			).toBe(true);
+		}
+		// Pi's substitute when Anthropic sends no explanation.
+		expect(
+			shouldHandleRefusal({
+				...fableRefusal,
+				errorMessage: "The model refused to complete the request",
+			}),
+		).toBe(true);
+	});
+
 	it("does not handle other model families or unrelated errors", () => {
 		expect(
 			shouldHandleRefusal({ ...fableRefusal, model: "claude-sonnet-4-5" }),
 		).toBe(false);
-		expect(
-			shouldHandleRefusal({ ...fableRefusal, errorMessage: "network timeout" }),
-		).toBe(false);
+		for (const errorMessage of [
+			"network timeout",
+			"overloaded_error: Overloaded",
+			"503 service unavailable",
+			"fetch failed",
+		]) {
+			expect(shouldHandleRefusal({ ...fableRefusal, errorMessage })).toBe(false);
+		}
 	});
 
 	it("ignores runs that did not end in a refusal", async () => {

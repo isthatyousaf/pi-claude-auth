@@ -22,9 +22,20 @@ function isAnthropicFableOrOpus5(model: unknown): boolean {
 	return id.includes("claude-fable-5") || id.includes("claude-opus-5");
 }
 
+/**
+ * Match Anthropic's refusal wording.
+ *
+ * Anthropic returns a refusal as a normal response carrying a stable category
+ * (`cyber`, `bio`, ...) plus a free-text explanation, and Pi keeps only the
+ * explanation. Anthropic documents that text as unstable and asks callers to
+ * display rather than parse it, so this pattern is the widest net available:
+ * live refusals read "This request was declined because it could enable cyber
+ * harm", while Pi substitutes "The model refused to complete the request" when
+ * Anthropic sends no explanation.
+ */
 function isRefusalError(message: unknown): boolean {
 	if (typeof message !== "string") return false;
-	return /refus|classifier|safety|safeguard|usage policy|violative|refusals-and-fallback/i.test(
+	return /refus|declin|classifier|safety|safeguard|usage policy|violative|refusals-and-fallback/i.test(
 		message,
 	);
 }
