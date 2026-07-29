@@ -55,7 +55,7 @@ If startup cannot reach npm and has no cache, Pi falls back to a built-in versio
 
 Claude Fable 5 and Opus 5 route some requests through safety classifiers. When a classifier blocks a turn, Anthropic returns the refusal as a finished message with `stop_reason: "refusal"` and an explanation. Pi maps that to `stopReason: "error"` with the explanation in `errorMessage`.
 
-This extension pauses the TUI when a finalized Anthropic Fable 5 or Opus 5 assistant message looks like a classifier refusal. The user can switch to Claude Opus 4.8 and continue there, or branch to the exact point immediately before the refusal and type new steering instructions with the original model still selected.
+This extension pauses and shows a choice dialog when a finalized Anthropic Fable 5 or Opus 5 assistant message looks like a classifier refusal. The user can switch to Claude Opus 4.8 and continue there, or branch to the exact point immediately before the refusal and type new steering instructions with the original model still selected.
 
 This is not Anthropic server-side fallback. Server-side fallback sends one request with a `fallbacks` chain and lets Anthropic pick the model internally. The extension runs a separate Pi turn using the normalized refusal message Pi exposes.
 
@@ -77,19 +77,21 @@ Network timeouts and generic proxy errors fail the wording gate. Other model fam
 
 **Edit and retry** branches the session tree directly at `agent_end` to the safe point immediately before the event that triggered the refusal — skipping both that trigger event and the refusal itself. No command staging or extra keypress is needed. The user's in-progress editor draft is restored. A hidden extension entry makes the selected branch durable across session reopen, and every later `context` event rebuilds provider input from that active branch until Pi performs supported tree navigation or compaction. Reload restores that repair state from the marker. Completed work before the trigger remains on the active branch; the refused path stays available in `/tree`.
 
-**Known limitation:** The visible TUI transcript does not refresh after direct branching because `sessionManager.branch()` (cast from the read-only type) cannot rebuild Pi's private `agent.state.messages` or chat component tree. `navigateTree()` — which synchronizes both — is only available on `ExtensionCommandContext`, not the `ExtensionContext` that event handlers receive. The model still receives the correct active-branch context. Manual `/tree` navigation, successful compaction, reload, or session replacement rebuilds the visible transcript.
+**Known limitation:** The visible TUI transcript does not refresh after direct branching because `sessionManager.branch()` (cast from the read-only type) cannot rebuild Pi's private `agent.state.messages` or chat component tree. `navigateTree()` — which synchronizes both — is only available on `ExtensionCommandContext`, not the `ExtensionContext` that event handlers receive, and extension-sent messages cannot reach a command either (`AgentSession.sendUserMessage` disables command dispatch). The model still receives the correct active-branch context. Manual `/tree` navigation, successful compaction, reload, or session replacement rebuilds the visible transcript.
 
 Escape stops and leaves the refusal as the active leaf.
 
-Set `PI_CLAUDE_AUTH_REFUSAL_MODE=auto` to skip the menu and always continue with Claude Opus 4.8. The default is `ask`. Non-TUI modes stop instead of silently choosing when the mode is `ask`.
+Set `PI_CLAUDE_AUTH_REFUSAL_MODE=auto` to skip the menu and always continue with Claude Opus 4.8. The default is `ask`. Modes without an interactive UI (`-p`, JSON) stop instead of silently choosing when the mode is `ask`.
 
 #### Limits
 
-The extension can recover only after Pi finishes the refusal and emits `message_end`. If the stream hangs first, there is no finalized refusal entry to handle.
+The extension can recover only after Pi finishes the run and emits `agent_end`, which is also when the refusal has been persisted. If the stream hangs first, there is no finalized refusal entry to handle.
 
 Pi does not expose queue clearing to event handlers. Steering or follow-up messages already queued when the refusal finishes may still run automatically after the branch.
 
 Edit and retry rewinds Pi's conversation/session context only. It does not undo filesystem changes, shell commands, network calls, or other external side effects already produced by the abandoned tool turn.
+
+While the context rebuild is active, a later Pi auto-retry sees the branch as persisted, including any errored assistant message Pi would normally strip from context on retry.
 
 #### Deterministic mid-work refusal demo
 

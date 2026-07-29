@@ -3,15 +3,12 @@ import type {
 	ExtensionContext,
 	SessionManager,
 } from "@earendil-works/pi-coding-agent";
-import { showRefusalMenu } from "./refusal-ui.ts";
 
 const OPUS_FALLBACK_MODEL_ID = "claude-opus-4-8";
 const CONTINUE_MESSAGE_TYPE = "claude-refusal-continue";
 const BRANCH_ENTRY_TYPE = "claude-refusal-branch";
 
-type RefusalMode = "ask" | "auto";
-
-export interface AssistantRefusalCandidate {
+interface AssistantRefusalCandidate {
 	role?: unknown;
 	provider?: unknown;
 	model?: unknown;
@@ -44,32 +41,10 @@ export function shouldHandleRefusal(
 	);
 }
 
-export function getRefusalMode(): RefusalMode {
+export function getRefusalMode(): "ask" | "auto" {
 	return process.env.PI_CLAUDE_AUTH_REFUSAL_MODE?.toLowerCase() === "auto"
 		? "auto"
 		: "ask";
-}
-
-export function createRetryAfterRefusalState() {
-	let handlingRefusal = false;
-	return {
-		begin(message: AssistantRefusalCandidate): boolean {
-			if (handlingRefusal || !shouldHandleRefusal(message)) return false;
-			handlingRefusal = true;
-			return true;
-		},
-		complete(): void {
-			handlingRefusal = false;
-		},
-	};
-}
-
-function modelField(model: unknown, field: "id" | "name"): string | undefined {
-	if (!model || typeof model !== "object") return undefined;
-	const value = (model as Record<string, unknown>)[field];
-	return typeof value === "string" && value.trim().length > 0
-		? value
-		: undefined;
 }
 
 function displayModelName(
@@ -79,13 +54,8 @@ function displayModelName(
 ): string {
 	if (typeof modelId !== "string" || modelId.trim().length === 0)
 		return "unknown model";
-
-	const selectedId = modelField(ctx.model, "id");
-	const selectedName = modelField(ctx.model, "name");
-	if (selectedId === modelId && selectedName) return selectedName;
-
-	const registryModel = ctx.modelRegistry.find(provider, modelId);
-	return modelField(registryModel, "name") ?? modelId;
+	if (ctx.model?.id === modelId && ctx.model.name) return ctx.model.name;
+	return ctx.modelRegistry.find(provider, modelId)?.name || modelId;
 }
 
 interface SessionMessageEntry {
@@ -95,13 +65,23 @@ interface SessionMessageEntry {
 	message: { role?: string };
 }
 
+function messageEntry(
+	sessionManager: ExtensionContext["sessionManager"],
+	id: string,
+): SessionMessageEntry | undefined {
+	const entry = sessionManager.getEntry(id);
+	return entry?.type === "message"
+		? (entry as unknown as SessionMessageEntry)
+		: undefined;
+}
+
 /**
  * Compute the active leaf that skips both the trigger event and the refusal.
  *
- * - Tool-result trigger: walk back through consecutive tool results to find the
- *   assistant tool-call message that started the batch, then keep its parent.
- * - User-message trigger: keep its parent so the triggering prompt is removed.
- * - Anything else: keep the trigger's parent.
+ * Tool results are climbed first: a tool-call batch and its results are atomic,
+ * so the whole batch is abandoned by keeping the parent of the assistant message
+ * that started it. Any other trigger keeps its own parent, which drops the
+ * triggering message itself.
  *
  * A null result means the trigger was the root entry and the leaf must be reset.
  */
@@ -109,27 +89,17 @@ export function computeBranchTarget(
 	sessionManager: ExtensionContext["sessionManager"],
 	triggerId: string,
 ): string | null {
-	const trigger = sessionManager.getEntry(triggerId) as SessionMessageEntry | undefined;
-	if (!trigger || trigger.type !== "message") return triggerId;
+	let current = messageEntry(sessionManager, triggerId);
+	if (!current) return triggerId;
 
-	if (trigger.message.role === "toolResult") {
-		let currentId: string | null = triggerId;
-		while (currentId) {
-			const entry = sessionManager.getEntry(currentId) as SessionMessageEntry | undefined;
-			if (!entry || entry.type !== "message" || entry.message.role !== "toolResult")
-				break;
-			const parentId = entry.parentId;
-			if (!parentId) return null;
-			const parent = sessionManager.getEntry(parentId) as SessionMessageEntry | undefined;
-			if (parent?.type === "message" && parent.message.role === "toolResult") {
-				currentId = parentId;
-				continue;
-			}
-			return parent?.type === "message" ? parent.parentId : parentId;
-		}
+	while (current.message.role === "toolResult") {
+		if (!current.parentId) return null;
+		const parent = messageEntry(sessionManager, current.parentId);
+		if (!parent) return current.parentId;
+		current = parent;
 	}
 
-	return trigger.parentId;
+	return current.parentId;
 }
 
 function hasRefusalBranchMarker(
@@ -143,49 +113,77 @@ function hasRefusalBranchMarker(
 		);
 }
 
-type PendingAction =
-	| { type: "continue"; refusedModelName: string }
-	| {
-			type: "edit";
-			triggerId: string;
-			targetId: string | null;
-			draft: string;
-	  };
+async function chooseRefusalAction(
+	ctx: ExtensionContext,
+	refusedModelName: string,
+	fallbackModelName: string,
+	canEdit: boolean,
+): Promise<"continue" | "edit" | undefined> {
+	const continueLabel = `Continue with ${fallbackModelName}`;
+	const editLabel = `Edit and retry with ${refusedModelName}`;
+	const choice = await ctx.ui.select(
+		`${refusedModelName}'s safeguards flagged this response.`,
+		canEdit ? [continueLabel, editLabel] : [continueLabel],
+	);
+	if (choice === continueLabel) return "continue";
+	if (choice === editLabel) return "edit";
+	return undefined;
+}
+
+/**
+ * Find the entry Pi persisted for this exact message object.
+ *
+ * The leaf is not reliable here: extension `agent_end` handlers run serially,
+ * so another extension can append an entry and move the leaf before this one
+ * runs. SessionManager stores the message object itself, so identity is exact.
+ */
+function findEntryIdByMessage(
+	sessionManager: ExtensionContext["sessionManager"],
+	message: unknown,
+): string | undefined {
+	const entries = sessionManager.getEntries();
+	for (let i = entries.length - 1; i >= 0; i--) {
+		const entry = entries[i];
+		if (entry.type === "message" && entry.message === message) return entry.id;
+	}
+	return undefined;
+}
+
+function lastAssistantMessage(
+	messages: unknown[],
+): AssistantRefusalCandidate | undefined {
+	for (let i = messages.length - 1; i >= 0; i--) {
+		const message = messages[i] as AssistantRefusalCandidate;
+		if (message.role === "assistant") return message;
+	}
+	return undefined;
+}
 
 export function registerRetryAfterRefusal(pi: ExtensionAPI): void {
-	const state = createRetryAfterRefusalState();
-	let pending: PendingAction | undefined;
 	let needsContextRebuild = false;
 
-	pi.on("session_start", (_event, ctx) => {
-		needsContextRebuild = hasRefusalBranchMarker(ctx.sessionManager);
+	// Only an extension reload leaves Pi's agent state behind: every other entry
+	// path rebuilds it from the session branch, which is already the repaired one.
+	pi.on("session_start", (event, ctx) => {
+		needsContextRebuild =
+			event.reason === "reload" && hasRefusalBranchMarker(ctx.sessionManager);
 	});
 
 	async function continueWithFallback(
 		ctx: ExtensionContext,
 		refusedModelName: string,
 	): Promise<void> {
-		const fallbackModel = ctx.modelRegistry.find(
-			"anthropic",
-			OPUS_FALLBACK_MODEL_ID,
-		);
 		const fallbackModelName = displayModelName(
 			ctx,
 			"anthropic",
 			OPUS_FALLBACK_MODEL_ID,
 		);
-		if (!fallbackModel) {
-			state.complete();
-			ctx.ui.notify(
-				`${refusedModelName} refusal detected, but ${fallbackModelName} could not be selected.`,
-				"error",
-			);
-			return;
-		}
-
-		const switched = await pi.setModel(fallbackModel);
+		const fallbackModel = ctx.modelRegistry.find(
+			"anthropic",
+			OPUS_FALLBACK_MODEL_ID,
+		);
+		const switched = fallbackModel ? await pi.setModel(fallbackModel) : false;
 		if (!switched) {
-			state.complete();
 			ctx.ui.notify(
 				`${refusedModelName} refusal detected, but ${fallbackModelName} could not be selected.`,
 				"error",
@@ -193,7 +191,6 @@ export function registerRetryAfterRefusal(pi: ExtensionAPI): void {
 			return;
 		}
 
-		state.complete();
 		ctx.ui.notify(
 			`Switched to ${fallbackModelName} and continuing from the current state.`,
 			"warning",
@@ -208,69 +205,48 @@ export function registerRetryAfterRefusal(pi: ExtensionAPI): void {
 		);
 	}
 
-	pi.on("message_end", async (event, ctx) => {
-		const message = event.message as AssistantRefusalCandidate;
-		if (message.role === "user") {
-			pending = undefined;
-			return;
-		}
-		if (!state.begin(message)) return;
+	// A classifier refusal ends the run, so `agent_end` always follows it, fires
+	// once, and — unlike `message_end` — runs after Pi has persisted the refusal.
+	// That persistence is what gives Edit a session entry to rewind from.
+	pi.on("agent_end", async (event, ctx) => {
+		const message = lastAssistantMessage(event.messages);
+		if (!message || !shouldHandleRefusal(message)) return;
 
 		const refusedModelName = displayModelName(ctx, "anthropic", message.model);
 		if (getRefusalMode() === "auto") {
-			pending = { type: "continue", refusedModelName };
+			await continueWithFallback(ctx, refusedModelName);
 			return;
 		}
 
-		if (ctx.mode !== "tui") {
-			state.complete();
+		if (!ctx.hasUI) {
 			ctx.ui.notify(
-				`${refusedModelName} returned an Anthropic classifier refusal. Interactive refusal handling requires Pi's TUI.`,
+				`${refusedModelName} returned an Anthropic classifier refusal. Interactive refusal handling requires an interactive UI.`,
 				"error",
 			);
 			return;
 		}
 
-		const fallbackModelName = displayModelName(
-			ctx,
-			"anthropic",
-			OPUS_FALLBACK_MODEL_ID,
-		);
-		const triggerId = ctx.sessionManager.getLeafId();
-		const action = await showRefusalMenu(
+		// The event that triggered the refusal is the refusal entry's parent.
+		const refusalId = findEntryIdByMessage(ctx.sessionManager, message);
+		const triggerId = refusalId
+			? (messageEntry(ctx.sessionManager, refusalId)?.parentId ?? null)
+			: null;
+
+		const action = await chooseRefusalAction(
 			ctx,
 			refusedModelName,
-			fallbackModelName,
+			displayModelName(ctx, "anthropic", OPUS_FALLBACK_MODEL_ID),
 			triggerId !== null,
 		);
 
 		if (action === "continue") {
-			pending = { type: "continue", refusedModelName };
+			await continueWithFallback(ctx, refusedModelName);
 			return;
 		}
-		if (action === "edit" && triggerId) {
-			state.complete();
-			pending = {
-				type: "edit",
-				triggerId,
-				targetId: computeBranchTarget(ctx.sessionManager, triggerId),
-				draft: ctx.ui.getEditorText(),
-			};
-			return;
-		}
+		if (action !== "edit" || !triggerId) return;
 
-		state.complete();
-	});
-
-	pi.on("agent_end", async (_event, ctx) => {
-		const action = pending;
-		pending = undefined;
-		if (!action) return;
-
-		if (action.type === "continue") {
-			await continueWithFallback(ctx, action.refusedModelName);
-			return;
-		}
+		const targetId = computeBranchTarget(ctx.sessionManager, triggerId);
+		const draft = ctx.ui.getEditorText();
 
 		// Edit: move the session leaf to the safe parent, then append a hidden
 		// extension entry there. SessionManager persists entries, not leaf moves,
@@ -281,21 +257,24 @@ export function registerRetryAfterRefusal(pi: ExtensionAPI): void {
 		// KNOWN LIMITATION: direct SessionManager mutation cannot rebuild Pi's
 		// visible transcript. It stays stale until a supported tree navigation,
 		// compaction, reload, or session replacement reconstructs the TUI.
+		// navigateTree() would do all of that, but it only exists on
+		// ExtensionCommandContext, and extension-sent messages bypass command
+		// dispatch (AgentSession.sendUserMessage disables command handling), so
+		// an event handler cannot reach it.
 		const sm = ctx.sessionManager as unknown as SessionManager;
 		try {
-			if (action.targetId === null) sm.resetLeaf();
-			else sm.branch(action.targetId);
+			if (targetId === null) sm.resetLeaf();
+			else sm.branch(targetId);
 		} catch {
-			ctx.ui.notify("Could not branch to the point before the refusal.", "error");
-			state.complete();
+			ctx.ui.notify(
+				"Could not branch to the point before the refusal.",
+				"error",
+			);
 			return;
 		}
 
 		try {
-			pi.appendEntry(BRANCH_ENTRY_TYPE, {
-				triggerId: action.triggerId,
-				targetId: action.targetId,
-			});
+			pi.appendEntry(BRANCH_ENTRY_TYPE, { triggerId, targetId });
 		} catch {
 			ctx.ui.notify(
 				"Branched before the refusal, but could not persist that branch selection.",
@@ -304,8 +283,7 @@ export function registerRetryAfterRefusal(pi: ExtensionAPI): void {
 		}
 
 		needsContextRebuild = true;
-		ctx.ui.setEditorText(action.draft);
-		state.complete();
+		ctx.ui.setEditorText(draft);
 	});
 
 	// Safety net: direct branching does not mutate agent.state.messages. Rebuild
