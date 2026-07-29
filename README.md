@@ -4,7 +4,7 @@
 
 When Pi calls Anthropic with an OAuth token, Anthropic treats it as third-party harness traffic. It routes those requests through a separate "extra usage" bucket and bills them per token, outside your plan window. This extension sends the Claude Code billing header and identity, so Anthropic sees the request as Claude Code traffic and draws it from your plan quota.
 
-Pi's built-in `anthropic` provider owns the OAuth lifecycle (browser login, token refresh, and credential storage in `~/.pi/agent/auth.json`). This extension adds only the pieces pi's provider does not send, so requests bill against your plan: the Claude Code user-agent header and the billing header, plus a retry on Anthropic classifier refusals. It deliberately does **not** register a custom OAuth lifecycle — doing so would overwrite pi's built-in provider and break `/login`. (Pi already prefers the stored OAuth token over any `ANTHROPIC_API_KEY` env var, so the extension never needs to touch credentials.)
+Pi handles the login itself. This extension adds the two headers Pi does not send, and it steps in when Claude refuses a request. It stays out of your credentials: `/login` keeps working the way it always has.
 
 ## 🌐 **Join the Community**
 
@@ -21,120 +21,60 @@ Pi's built-in `anthropic` provider owns the OAuth lifecycle (browser login, toke
 pi install git:github.com/edxeth/pi-claude-auth
 ```
 
+## Setup
+
+Run `/login anthropic` and finish the browser flow. That is the whole setup.
+
+Pi stores the credential in `~/.pi/agent/auth.json` and refreshes it when it expires. This extension never touches that file. If you also have `ANTHROPIC_API_KEY` set, Pi still prefers your subscription login.
+
 ## How it works
 
-Three things have to line up before Anthropic bills a request against your plan: the right OAuth token, the Claude Code identity in the system prompt, and the billing header that carries the version. Pi's built-in Anthropic provider handles the token plumbing (login, refresh, storage) and the identity. This extension adds the billing header and keeps the version current.
+Three things have to line up before Anthropic bills a request to your plan: a valid login, the Claude Code identity in the system prompt, and a header carrying the current Claude Code version. Pi covers the first two. This extension adds the header and keeps the version fresh.
 
-### Credentials
+Anthropic rejects requests that carry someone else's system prompt next to the Claude Code identity, so the extension moves Pi's system prompt into your first message. Your instructions still reach the model.
 
-Run `/login anthropic`. Pi's built-in provider performs the browser OAuth flow and writes the `anthropic` entry to `~/.pi/agent/auth.json`:
+Part of the header uses a simplified scheme that works because Anthropic does not check it today. If that changes, requests will fail until this extension ships a fix.
 
-```json
-{ "anthropic": { "type": "oauth", "access": "…", "refresh": "…", "expires": 1750… } }
-```
+### Staying on the current version
 
-That file is the single source of truth; the extension never reads or writes it. Pi loads the OAuth entry at startup, and its `getApiKey` already prefers that token over any `ANTHROPIC_API_KEY` in your environment, so no credential handling is needed here. Token refresh is handled by pi's built-in provider (which mints and refreshes at Anthropic's `platform.claude.com/v1/oauth/token` endpoint); the extension does not refresh tokens itself.
+Anthropic rejects the header if the version does not match a real Claude Code release, so the extension looks up the newest release on npm at startup and caches it in `~/.pi/agent/claude-code-version.json`.
 
-### The billing header
+If npm is unreachable, it falls back to that cache and shows a yellow alert. With no cache to fall back on, it uses a built-in version and shows a red alert, which means requests may be rejected or billed as extra usage. Press Enter or Escape to dismiss either one. Offline runs stay quiet.
 
-Every request gets an `x-anthropic-billing-header` system block that carries the Claude Code version and entrypoint. That header is what routes billing to the subscription plan.
+## When Claude refuses
 
-Pi's own system prompt gets relocated into the first user message. Anthropic rejects OAuth requests that carry third-party system prompts alongside the Claude Code identity, so the prompt has to move out of `system[]` to avoid a 400 "out of extra usage" rejection.
+Fable 5 and Opus 5 run some requests past a safety classifier. When it blocks one, your turn dies with an error instead of an answer, often after Claude has already done real work.
 
-The `cch` token uses a simplified scheme. It works because Anthropic does not currently enforce `cch` validation. The day Anthropic starts enforcing it, requests will fail until the extension ships an update.
+Instead of leaving you with a dead turn, this extension pauses and offers two ways out.
 
-### Version sync
+**Continue with Claude Opus 4.8** switches models and carries on from where things stopped. Finished tool work stays. Opus 4.8 stays selected for the rest of the session, so you keep going without another interruption.
 
-The billing version has to match current Claude Code, or Anthropic rejects the request. The extension resolves the latest `@anthropic-ai/claude-code` version from the npm registry at startup, caches it under `~/.pi/agent/claude-code-version.json`, and falls back to that cache when the registry is unreachable.
+**Edit and retry** rewinds to just before whatever set the classifier off and gives you the prompt box back, still on the original model. Work finished earlier in the turn stays put. If the refusal followed a batch of tool calls, the whole batch goes, since keeping half of it would leave a tool call with no result. Anything you had typed comes back in the editor. The refused path is still there under `/tree` if you want to look at it.
 
-The version suffix is computed per request from the current Claude Code algorithm. It is not pinned to a fixed build hash.
+Press Escape to take neither and keep the refusal.
 
-If startup cannot reach npm and has no cache, Pi falls back to a built-in version and shows a red alert. If it falls back to a cached version, it shows a yellow alert. Both dismiss with Enter or Escape. Offline runs stay silent.
+Only Fable 5 and Opus 5 refusals count. Network timeouts, proxy errors, and other models pass straight through, and the Opus 4.8 continuation cannot set the whole thing off again.
 
-### Fable 5 and Opus 5 refusal handling
+Set `PI_CLAUDE_AUTH_REFUSAL_MODE=auto` to skip the question and always continue with Opus 4.8. Outside an interactive terminal (`-p`, JSON output) you get a message saying the turn was refused, and nothing else happens.
 
-Claude Fable 5 and Opus 5 route some requests through safety classifiers. When a classifier blocks a turn, Anthropic returns the refusal as a finished message with `stop_reason: "refusal"` and an explanation. Pi maps that to `stopReason: "error"` with the explanation in `errorMessage`.
+### Where Edit and retry stops
 
-This extension pauses and shows a choice dialog when a finalized Anthropic Fable 5 or Opus 5 assistant message looks like a classifier refusal. The user can switch to Claude Opus 4.8 and continue there, or branch to the exact point immediately before the refusal and type new steering instructions with the original model still selected.
+The chat on your screen keeps showing the abandoned turn. Claude has the corrected history, so your next message behaves the way you expect, but the view is stale until you visit `/tree`, run `/reload`, or compact the session.
 
-This is not Anthropic server-side fallback. Server-side fallback sends one request with a `fallbacks` chain and lets Anthropic pick the model internally. The extension runs a separate Pi turn using the normalized refusal message Pi exposes.
+The rewind covers the conversation. Files written, commands run, and requests sent during the abandoned turn stay exactly as the model left them.
 
-#### What counts as a refusal
+Anything you typed while the refusal was landing still runs after the rewind. Pi gives extensions no way to clear that queue.
 
-All five conditions must hold on the finalized assistant message:
-
-- role is `assistant`
-- provider is `anthropic`
-- model id contains `claude-fable-5` or `claude-opus-5`
-- `stopReason` is `error`
-- `errorMessage` matches refusal wording (`refus`, `classifier`, `safety`, `safeguard`, `usage policy`, `violative`, or `refusals-and-fallback`)
-
-Network timeouts and generic proxy errors fail the wording gate. Other model families fail the model gate. The Claude Opus 4.8 continuation also fails the model gate, so it cannot retrigger the workflow.
-
-#### Interactive choices
-
-**Continue with Claude Opus 4.8** waits until Pi has persisted the refusal, switches the active model, and sends a hidden custom message containing exactly `continue`. The fallback model sees the existing transcript and completed tool work, but the continuation message is not rendered to the user. Claude Opus 4.8 remains selected for later turns.
-
-**Edit and retry** branches the session tree directly at `agent_end` to the safe point immediately before the event that triggered the refusal — skipping both that trigger event and the refusal itself. No command staging or extra keypress is needed. The user's in-progress editor draft is restored. A hidden extension entry makes the selected branch durable across session reopen, and every later `context` event rebuilds provider input from that active branch until Pi performs supported tree navigation or compaction. Reload restores that repair state from the marker. Completed work before the trigger remains on the active branch; the refused path stays available in `/tree`.
-
-**Known limitation:** The visible TUI transcript does not refresh after direct branching because `sessionManager.branch()` (cast from the read-only type) cannot rebuild Pi's private `agent.state.messages` or chat component tree. `navigateTree()` — which synchronizes both — is only available on `ExtensionCommandContext`, not the `ExtensionContext` that event handlers receive, and extension-sent messages cannot reach a command either (`AgentSession.sendUserMessage` disables command dispatch). The model still receives the correct active-branch context. Manual `/tree` navigation, successful compaction, reload, or session replacement rebuilds the visible transcript.
-
-Escape stops and leaves the refusal as the active leaf.
-
-Set `PI_CLAUDE_AUTH_REFUSAL_MODE=auto` to skip the menu and always continue with Claude Opus 4.8. The default is `ask`. Modes without an interactive UI (`-p`, JSON) stop instead of silently choosing when the mode is `ask`.
-
-#### Limits
-
-The extension can recover only after Pi finishes the run and emits `agent_end`, which is also when the refusal has been persisted. If the stream hangs first, there is no finalized refusal entry to handle.
-
-Pi does not expose queue clearing to event handlers. Steering or follow-up messages already queued when the refusal finishes may still run automatically after the branch.
-
-Edit and retry rewinds Pi's conversation/session context only. It does not undo filesystem changes, shell commands, network calls, or other external side effects already produced by the abandoned tool turn.
-
-While the context rebuild is active, a later Pi auto-retry sees the branch as persisted, including any errored assistant message Pi would normally strip from context on retry.
-
-#### Deterministic mid-work refusal demo
-
-From the repository root, use the fake Anthropic provider to exercise the critical multi-turn path without making an external model request:
-
-```bash
-PI_OFFLINE=1 \
-PI_CLAUDE_AUTH_REFUSAL_MODE=ask \
-pi --no-extensions \
-  -e ./src/index.ts \
-  -e ./test/fixtures/refusal-simulator.ts \
-  --model anthropic/claude-fable-5 \
-  --api-key refusal-simulator-local-only \
-  --thinking high \
-  --session-dir "/tmp/pi-refusal-demo-$(date +%s)"
-```
-
-Enter any prompt. The simulator produces this sequence:
-
-1. Fable thinking + assistant text + baseline tool A
-2. The completed result from tool A
-3. More Fable thinking + assistant text + tool B
-4. The completed result from tool B
-5. More Fable thinking + assistant text + a separate tool C
-6. The completed result from tool C
-7. A classifier refusal
-
-Choosing **Edit and retry** keeps everything through tool B's completed result, then abandons the assistant turn that called tool C, tool C's result, and the refusal. Enter a revised prompt to see Fable continue from immediately before tool C. Choosing **Continue** switches to the simulated Opus 4.8 and sends the hidden `continue` message. Run `/reload` after Edit to repaint the transcript from the active branch.
-
-If B and C are emitted together inside one assistant message, Pi has no branch boundary between them. That assistant message and all of its tool results form one atomic batch, so Edit must discard the whole batch rather than leave an orphaned tool call or result.
-
-### `/login anthropic`
-
-`/login anthropic` works exactly the usual Pi way — the extension does not register a custom OAuth lifecycle, so pi's built-in `anthropic` provider stays in charge of the browser login, refresh, and storage. Log in once and pi persists the credential to `~/.pi/agent/auth.json`, which this extension then reads on every start.
+The extension steps in once the refusal has fully arrived. A stream that hangs instead never gets that far, and you are back to aborting the turn yourself.
 
 ## Environment variables
 
 | Variable | Use |
 | --- | --- |
 | `ANTHROPIC_CLI_VERSION` | Override the Claude Code version. Must be valid semver, or the extension ignores it and uses the resolved version. |
-| `CLAUDE_CODE_ENTRYPOINT` | Override the billing entrypoint mirrored in the user-agent suffix. |
+| `CLAUDE_CODE_ENTRYPOINT` | Override the entrypoint name sent in the billing header and user-agent. |
 | `ANTHROPIC_USER_AGENT` | Override the whole user-agent string. |
-| `PI_CLAUDE_AUTH_DEBUG` | Set `1` for opt-in diagnostic logging to `~/.pi/agent/pi-claude-auth-debug.log`. Secrets are redacted before anything is written. |
+| `PI_CLAUDE_AUTH_DEBUG` | Set `1` to write diagnostics to `~/.pi/agent/pi-claude-auth-debug.log`. The log redacts secrets. |
 | `PI_CLAUDE_AUTH_REFUSAL_MODE` | Refusal policy for Fable 5 and Opus 5: `ask` (default) or `auto`. |
 
 ## Credits
