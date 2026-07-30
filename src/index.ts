@@ -2,7 +2,6 @@ import type {
 	ExtensionAPI,
 	ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
-import { Container, matchesKey, Text } from "@earendil-works/pi-tui";
 import {
 	type ClaudeCodeVersionResolution,
 	type ClaudeCodeVersionStatus,
@@ -51,49 +50,18 @@ function buildVersionAlert(
 }
 
 /**
- * Focused-component alert overlay. The TUI input loop routes keys to the focused
- * component's `handleInput`; `Text` has none, so a plain Text silently drops
- * keys and the alert can never be dismissed. This Container subclass dismisses
- * on Enter or Escape and otherwise consumes the key.
- */
-class VersionAlertComponent extends Container {
-	private readonly dismiss: () => void;
-	constructor(content: string, dismiss: () => void) {
-		super();
-		this.dismiss = dismiss;
-		this.addChild(new Text(content, 0, 0));
-	}
-	handleInput(data: string): void {
-		if (matchesKey(data, "return") || matchesKey(data, "escape")) {
-			this.dismiss();
-		}
-	}
-}
-
-/**
- * Show a red/yellow version-discovery alert via the TUI custom widget. Only live
- * fetch failures are surfaced; PI_OFFLINE resolutions are treated as
+ * Report a red/yellow version-discovery notification without taking input
+ * focus. Only live fetch failures are surfaced; PI_OFFLINE resolutions are
  * intentional and stay silent.
  */
-async function showVersionAlert(
+function showVersionAlert(
 	ctx: ExtensionContext,
 	res: ClaudeCodeVersionResolution,
-): Promise<void> {
+): void {
 	if (ctx.mode !== "tui") return;
 	const alert = buildVersionAlert(res.status, res.version, res.cachedAt);
 	if (!alert) return;
-	const color = alert.kind === "error" ? "error" : "warning";
-	await ctx.ui.custom<boolean>((_tui, theme, _keybindings, done) => {
-		const content = [
-			"",
-			theme.bold(theme.fg(color, alert.title)),
-			"",
-			theme.fg(color, alert.message),
-			"",
-			theme.fg("dim", "  Enter / Esc to dismiss"),
-		].join("\n");
-		return new VersionAlertComponent(content, () => done(true));
-	});
+	ctx.ui.notify(`${alert.title}\n${alert.message}`, alert.kind);
 }
 
 /**
@@ -136,9 +104,9 @@ const extension = async (pi: ExtensionAPI): Promise<void> => {
 	// Surface a degraded-version alert on startup (offline resolutions stay
 	// silent). No credential work here: pi already loaded auth.json and prefers
 	// the OAuth token over ANTHROPIC_API_KEY.
-	pi.on("session_start", async (event, ctx) => {
+	pi.on("session_start", (event, ctx) => {
 		if (event.reason === "startup") {
-			await showVersionAlert(ctx, versionResolution).catch(() => {});
+			showVersionAlert(ctx, versionResolution);
 		}
 	});
 

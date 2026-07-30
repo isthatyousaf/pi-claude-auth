@@ -5,6 +5,8 @@ import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import loadExtension from "../src/index.ts";
 
+const originalFetch = globalThis.fetch;
+
 type Handler = (...args: unknown[]) => unknown;
 
 interface SpyPi {
@@ -59,6 +61,7 @@ describe("extension wiring (Pi owns the OAuth lifecycle)", () => {
 		rmSync(dir, { recursive: true, force: true });
 		delete process.env.PI_CODING_AGENT_DIR;
 		delete process.env.ANTHROPIC_CLI_VERSION;
+		globalThis.fetch = originalFetch;
 	});
 
 	it("registers the anthropic provider with headers and NO custom oauth lifecycle", async () => {
@@ -112,5 +115,40 @@ describe("extension wiring (Pi owns the OAuth lifecycle)", () => {
 			await handler({ reason: "startup" }, ctx);
 		}
 		expect(setCalled).toBe(false);
+	});
+
+	it("reports a version fetch failure without opening a blocking custom UI", async () => {
+		delete process.env.ANTHROPIC_CLI_VERSION;
+		globalThis.fetch = (async () => {
+			throw new Error("network down");
+		}) as typeof fetch;
+
+		const spy = makeSpyPi();
+		await loadExtension(spy as unknown as ExtensionAPI);
+
+		const notifications: { message: string; kind: string }[] = [];
+		let customCalled = false;
+		const ctx = {
+			mode: "tui",
+			sessionManager: { getBranch: () => [] },
+			ui: {
+				notify(message: string, kind: string) {
+					notifications.push({ message, kind });
+				},
+				async custom() {
+					customCalled = true;
+					return new Promise(() => {});
+				},
+			},
+		};
+
+		for (const handler of spy.handlers.session_start ?? []) {
+			await handler({ reason: "startup" }, ctx);
+		}
+
+		expect(customCalled).toBe(false);
+		expect(notifications).toHaveLength(1);
+		expect(notifications[0]?.kind).toBe("error");
+		expect(notifications[0]?.message).toContain("version fetch failed");
 	});
 });

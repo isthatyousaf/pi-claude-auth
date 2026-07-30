@@ -39,7 +39,7 @@ Part of the header uses a simplified scheme that works because Anthropic does no
 
 Anthropic rejects the header if the version does not match a real Claude Code release, so the extension looks up the newest release on npm at startup and caches it in `~/.pi/agent/claude-code-version.json`.
 
-If npm is unreachable, it falls back to that cache and shows a yellow alert. With no cache to fall back on, it uses a built-in version and shows a red alert, which means requests may be rejected or billed as extra usage. Press Enter or Escape to dismiss either one. Offline runs stay quiet.
+If npm is unreachable, it falls back to that cache and shows a yellow notification. With no cache to fall back on, it uses a built-in version and shows a red notification, which means requests may be rejected or billed as extra usage. These notifications do not interrupt typing or session startup. Offline runs stay quiet.
 
 ## When Claude refuses
 
