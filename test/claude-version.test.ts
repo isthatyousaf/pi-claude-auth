@@ -128,8 +128,8 @@ describe("signing overrides", () => {
 		setDiscoveredCliVersion("1.0.0");
 		delete process.env.ANTHROPIC_CLI_VERSION;
 		delete process.env.ANTHROPIC_USER_AGENT;
-		expect(buildUserAgent()).toBe("claude-cli/1.0.0 (external, cli)");
-		process.env.ANTHROPIC_USER_AGENT = "custom-agent/1";
-		expect(buildUserAgent()).toBe("custom-agent/1");
+	expect(buildUserAgent()).toBe("claude-cli/1.0.0 (external, sdk-cli)");
+	process.env.ANTHROPIC_USER_AGENT = "custom-agent/1";
+	expect(buildUserAgent()).toBe("custom-agent/1");
 	});
 });

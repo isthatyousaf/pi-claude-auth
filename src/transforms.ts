@@ -5,7 +5,13 @@ import {
 } from "./signing.ts";
 
 const BILLING_PREFIX = "x-anthropic-billing-header";
-const CC_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude.";
+// Identity line pi's built-in provider emits for OAuth tokens (our trigger).
+const LEGACY_IDENTITY =
+	"You are Claude Code, Anthropic's official CLI for Claude.";
+// Identity line current Claude Code (2.1.224) sends; we substitute this for
+// pi's legacy line so the request matches real CC traffic.
+const AGENT_SDK_IDENTITY =
+	"You are a Claude agent, built on Anthropic's Claude Agent SDK.";
 
 type SystemEntry = { type?: string; text?: string } & Record<string, unknown>;
 
@@ -29,16 +35,22 @@ function entryText(entry: unknown): string {
 }
 
 /**
- * Inject the Claude Code billing header into an Anthropic request payload as
- * the first system entry.
+ * Transform an Anthropic OAuth request so Anthropic bills it to the Claude
+ * Pro/Max subscription instead of pay-as-you-go / "extra usage".
  *
- * pi's built-in Anthropic provider already sends the Claude Code identity,
- * beta flags, and user-agent for OAuth tokens, but it does not send the
- * `x-anthropic-billing-header` system block. That block is what routes billing
- * to the Claude Pro/Max subscription instead of pay-as-you-go API credits.
+ * pi opens OAuth requests with its legacy Claude Code identity at system[0],
+ * followed by whatever system prompt the agent supplied. This function:
  *
- * Returns the mutated payload when a billing header was injected, or undefined
- * to leave the payload unchanged (non-Claude requests, or already injected).
+ * - Prepends the `x-anthropic-billing-header` block as system[0].
+ * - Swaps pi's legacy identity for the Agent SDK identity Claude Code 2.1.224
+ *   sends (system[1]).
+ * - Relocates every other system block (pi's prompt, other extensions' prompts)
+ *   into the first user message. This move is mandatory: a live test confirmed
+ *   that leaving any third-party system block in system[] makes Anthropic bill
+ *   the request as extra usage.
+ *
+ * Returns the mutated payload when transformed, or undefined to leave it
+ * unchanged (non-Claude requests, non-OAuth requests, already-transformed).
  */
 export function injectBillingHeader(
 	payload: unknown,
@@ -53,62 +65,40 @@ export function injectBillingHeader(
 		? (p.system as SystemEntry[])
 		: [];
 
-	// Only inject when pi is in OAuth stealth mode, signalled by its Claude
-	// Code identity block. This avoids touching plain API-key requests (which
-	// bill correctly on their own and would be confused by the header).
-	if (!system.some((e) => entryText(e).startsWith(CC_IDENTITY))) {
-		return undefined;
-	}
-
-	// Already injected — leave it untouched (handler idempotency).
+	// Already transformed (billing header present): no-op.
 	if (system.some((e) => entryText(e).startsWith(BILLING_PREFIX))) {
 		return undefined;
 	}
+	// Only act in OAuth mode, signalled by pi's legacy identity. A plain
+	// API-key request has no such block and passes through unchanged.
+	if (!system.some((e) => entryText(e) === LEGACY_IDENTITY)) return undefined;
 
 	const messages = p.messages as Array<{
 		role?: string;
 		content?: string | Array<{ type?: string; text?: string }>;
 	}>;
-
 	const billingHeader = buildBillingHeaderValue(
 		messages,
 		getCliVersion(),
 		getEntrypoint(),
 	);
 
-	// Billing header goes first, ahead of pi's identity block. No
-	// cache_control so it does not consume a cache breakpoint.
-	p.system = [{ type: "text", text: billingHeader }, ...system];
-
-	// Relocate non-core system entries to user messages.
-	// Anthropic's API validates the system prompt for OAuth-authenticated
-	// requests that use Claude Code billing.  Third-party system prompts
-	// (like pi's) trigger a 400 "out of extra usage" rejection when
-	// they appear inside the system[] array alongside the identity prefix.
-	//
-	// Work-around: keep only the billing header and identity prefix in
-	// system[], and prepend all other system content to the first user
-	// message where it is functionally equivalent but avoids the check.
-	const keptSystem: SystemEntry[] = [];
+	// Drop pi's legacy identity and relocate every other system block (pi's real
+	// prompt, etc.) into the first user message.
 	const movedTexts: string[] = [];
-	for (const entry of p.system as SystemEntry[]) {
+	for (const entry of system) {
 		const txt = entryText(entry);
-		if (txt.startsWith(BILLING_PREFIX) || txt.startsWith(CC_IDENTITY)) {
-			keptSystem.push(entry);
-		} else if (txt.length > 0) {
-			movedTexts.push(txt);
-		}
+		if (txt.length > 0 && txt !== LEGACY_IDENTITY) movedTexts.push(txt);
 	}
 
+	p.system = [
+		{ type: "text", text: billingHeader },
+		{ type: "text", text: AGENT_SDK_IDENTITY },
+	];
+
 	if (movedTexts.length > 0) {
-		const firstUser = (
-			p.messages as Array<{
-				role?: string;
-				content?: string | Array<{ type?: string; text?: string }>;
-			}>
-		).find((m) => m.role === "user");
+		const firstUser = messages.find((m) => m.role === "user");
 		if (firstUser) {
-			p.system = keptSystem;
 			const prefix = movedTexts.join("\n\n");
 			const content = firstUser.content;
 			if (typeof content === "string") {

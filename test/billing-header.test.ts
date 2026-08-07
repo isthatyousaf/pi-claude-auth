@@ -1,13 +1,15 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { injectBillingHeader } from "../src/transforms.ts";
 
-const CC_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude.";
+const LEGACY_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude.";
+const AGENT_SDK_IDENTITY =
+	"You are a Claude agent, built on Anthropic's Claude Agent SDK.";
 const BILLING_PREFIX = "x-anthropic-billing-header";
 
 function claudePayload(overrides: Record<string, unknown> = {}) {
 	return {
 		model: "claude-sonnet-4-5",
-		system: [{ type: "text", text: CC_IDENTITY }],
+		system: [{ type: "text", text: LEGACY_IDENTITY }],
 		messages: [
 			{ role: "user", content: [{ type: "text", text: "Say hello." }] },
 		],
@@ -40,8 +42,8 @@ describe("injectBillingHeader", () => {
 			).toBeUndefined();
 		});
 
-		it("does nothing outside OAuth stealth mode (no Claude Code identity block)", () => {
-			// A plain API-key request: system has pi's own prompt, not the CC identity.
+		it("does nothing outside OAuth mode (no legacy identity block)", () => {
+			// A plain API-key request: system has pi's own prompt, not the identity.
 			expect(
 				injectBillingHeader({
 					model: "claude-sonnet-4-5",
@@ -61,14 +63,15 @@ describe("injectBillingHeader", () => {
 		});
 	});
 
-	describe("injection + system relocation", () => {
-		it("prepends the billing header as system[0] ahead of the identity block", () => {
+	describe("injection + system handling", () => {
+		it("prepends the billing header and swaps the legacy identity for the Agent SDK line", () => {
 			const out = injectBillingHeader(claudePayload()) as {
 				system: { type: string; text: string }[];
 			};
 			expect(out.system[0].text.startsWith(BILLING_PREFIX)).toBe(true);
-			// Identity block is preserved right after the header.
-			expect(out.system[1].text).toBe(CC_IDENTITY);
+			expect(out.system[1].text).toBe(AGENT_SDK_IDENTITY);
+			// The legacy identity pi sent is dropped entirely.
+			expect(out.system.some((e) => e.text === LEGACY_IDENTITY)).toBe(false);
 		});
 
 		it("formats the header as cc_version / cc_entrypoint / cch", () => {
@@ -76,8 +79,9 @@ describe("injectBillingHeader", () => {
 				system: { text: string }[];
 			};
 			const header = out.system[0].text;
+			// cch is a placeholder; the wrapped transport resolves it post-serialization.
 			expect(header).toMatch(
-				/^x-anthropic-billing-header: cc_version=1\.2\.3\.\d{3}; cc_entrypoint=cli; cch=[0-9a-f]{5};$/,
+				/^x-anthropic-billing-header: cc_version=1\.2\.3\.\d{3}; cc_entrypoint=sdk-cli; cch=00000;$/,
 			);
 		});
 
@@ -85,7 +89,7 @@ describe("injectBillingHeader", () => {
 			const payload = {
 				model: "claude-sonnet-4-5",
 				system: [
-					{ type: "text", text: CC_IDENTITY },
+					{ type: "text", text: LEGACY_IDENTITY },
 					{ type: "text", text: "You are pi, a coding agent." },
 				],
 				messages: [
@@ -99,14 +103,14 @@ describe("injectBillingHeader", () => {
 				system: { text: string }[];
 				messages: { role: string; content: { type: string; text: string }[] }[];
 			};
-			// Only billing header + identity remain in system[].
+			// Only billing header + Agent SDK identity remain in system[].
 			expect(out.system.map((e) => e.text)).toEqual([
 				expect.stringMatching(new RegExp(`^${BILLING_PREFIX}`)),
-				CC_IDENTITY,
+				AGENT_SDK_IDENTITY,
 			]);
 			// pi's prompt was prepended to the first user message's content blocks.
 			const firstUserContent = out.messages[0].content;
-			expect(firstUserContent[0].text).toContain("You are pi, a coding agent.");
+			expect(firstUserContent[0].text).toBe("You are pi, a coding agent.");
 			expect(firstUserContent[1].text).toBe("Do the thing.");
 		});
 
@@ -114,7 +118,7 @@ describe("injectBillingHeader", () => {
 			const payload = {
 				model: "claude-sonnet-4-5",
 				system: [
-					{ type: "text", text: CC_IDENTITY },
+					{ type: "text", text: LEGACY_IDENTITY },
 					{ type: "text", text: "Extra system instructions." },
 				],
 				messages: [{ role: "user", content: "Hello there." }],

@@ -26,7 +26,7 @@ export function setDiscoveredCliVersion(version: string): void {
 // Billing entrypoint, mirrored in the user-agent's `(external, <entrypoint>)`
 // suffix. `cli` is the Claude Code CLI route we emulate for pi.
 // Overridable via CLAUDE_CODE_ENTRYPOINT.
-const CC_ENTRYPOINT = "cli";
+const CC_ENTRYPOINT = "sdk-cli";
 
 /** Resolve the Claude Code CLI version (validated env override wins). */
 const SEMVER_RE = /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/;
