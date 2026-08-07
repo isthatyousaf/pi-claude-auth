@@ -1,10 +1,11 @@
 import { createHash } from "node:crypto";
+import { CCH_PLACEHOLDER } from "./cch.ts";
 
-// Billing salt used by Claude Code's cch scheme. This local extension keeps a
-// hook-safe cch algorithm because it runs in pi's before_provider_request hook
-// and does not own the final JSON serialization. A full-body xxHash signature
-// would be more fragile here unless this extension also replaced the whole
-// Anthropic stream transport.
+// Salt used in Claude Code's cc_version prompt fingerprint:
+// sha256("59cf53e54c78" + chars[4,7,20] of first user text + semver)[:3].
+// The `cch` body checksum is separate: the billing header carries a
+// `cch=00000` placeholder (CCH_PLACEHOLDER) that cch.ts resolves
+// post-serialization with a seeded XXH64 digest of the normalized body.
 const BILLING_SALT = "59cf53e54c78";
 
 // Fallback Claude Code CLI version used when startup version discovery fails.
@@ -42,9 +43,11 @@ export function getEntrypoint(): string {
 }
 
 /**
- * Build the Claude Code user-agent string. pi sends a bare
- * `claude-cli/<version>`; Anthropic's plan-billing validation expects the full
- * `claude-cli/<version> (external, <entrypoint>)` form, so we override it.
+ * Build the Claude Code user-agent string. pi's built-in Anthropic provider
+ * already sends a bare `claude-cli/<version>` for OAuth tokens; Anthropic's
+ * plan-billing validation expects the full
+ * `claude-cli/<version> (external, <entrypoint>)` form, so the wrapped provider
+ * overrides it via request headers.
  */
 export function buildUserAgent(): string {
 	return (
@@ -59,9 +62,9 @@ interface Message {
 }
 
 /**
- * Extract text from the first user message's first text block.
- * Mirrors Claude Code's billing-header input selection: find the first message
- * with role "user", then return the text of its first text content block.
+ * Extract the text of the first user message, joining every text block. Mirrors
+ * Claude Code's billing-header prompt selection: first user message, then all of
+ * its text blocks concatenated. Used only for the cc_version fingerprint.
  */
 function extractFirstUserMessageText(messages: Message[]): string {
 	const userMsg = messages.find((m) => m.role === "user");
@@ -69,41 +72,20 @@ function extractFirstUserMessageText(messages: Message[]): string {
 	const content = userMsg.content;
 	if (typeof content === "string") return content;
 	if (Array.isArray(content)) {
-		const textBlock = content.find((b) => b.type === "text");
-		if (textBlock && textBlock.type === "text" && textBlock.text) {
-			return textBlock.text;
-		}
+		return content
+			.filter((b) => b.type === "text")
+			.map((b) => b.text ?? "")
+			.join("");
 	}
 	return "";
 }
 
 /**
- * Compute cch using the original pi-claude-auth hook-safe scheme.
- *
- * WARNING — load-bearing assumption: current Claude Code (2.1.198) does NOT
- * compute cch this way. It writes `cch=00000;` and body-signs the final
- * serialized request with xxHash. This extension cannot do that because it
- * mutates pi's provider payload before the built-in Anthropic transport
- * serializes it, so it does not own the final body bytes. This simplified cch
- * works ONLY because Anthropic does not currently enforce cch validation
- * (proven by the live AUTH_OK smoke test). If Anthropic ever starts enforcing
- * cch, every request from this fork will fail with no in-product recovery — at
- * that point the fix is to replace the Anthropic stream transport so this code
- * owns serialization and can body-sign.
- */
-function computeCch(messageText: string): string {
-	return createHash("sha256").update(messageText).digest("hex").slice(0, 5);
-}
-
-/**
  * Compute the 3-char cc_version suffix.
  *
- * Current Claude Code does not use a fixed per-release build hash here. In
- * @anthropic-ai/claude-code 2.1.198, the suffix is:
- * sha256("59cf53e54c78" + chars[4,7,20] of first user text + semver).slice(0, 3).
- * Different prompts can therefore produce different suffixes for the same
- * Claude Code semver, and different semvers produce different suffixes for the
- * same prompt.
+ * sha256("59cf53e54c78" + chars[4,7,20] of first user text + semver).slice(0,3).
+ * Different prompts produce different suffixes for the same Claude Code semver,
+ * and different semvers produce different suffixes for the same prompt.
  */
 function computeVersionSuffix(messageText: string, version: string): string {
 	const sampled = [4, 7, 20]
@@ -115,7 +97,12 @@ function computeVersionSuffix(messageText: string, version: string): string {
 
 /**
  * Build the complete billing header string for insertion into system[0].
- * Format: x-anthropic-billing-header: cc_version=V.S; cc_entrypoint=E; cch=H;
+ * Format: x-anthropic-billing-header: cc_version=V.S; cc_entrypoint=E; cch=00000;
+ *
+ * The `cch` is written as a placeholder. The wrapped transport (cch.ts) owns the
+ * final serialized body and replaces it with the real 5-hex XXH64 digest of the
+ * normalized body once the SDK has serialized it — so the digest is computed
+ * over the exact bytes that go on the wire, not a pre-serialization guess.
  */
 export function buildBillingHeaderValue(
 	messages: Message[],
@@ -124,11 +111,10 @@ export function buildBillingHeaderValue(
 ): string {
 	const text = extractFirstUserMessageText(messages);
 	const suffix = computeVersionSuffix(text, version);
-	const cch = computeCch(text);
 	return (
 		`x-anthropic-billing-header: ` +
 		`cc_version=${version}.${suffix}; ` +
 		`cc_entrypoint=${entrypoint}; ` +
-		`cch=${cch};`
+		`${CCH_PLACEHOLDER};`
 	);
 }

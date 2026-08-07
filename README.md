@@ -33,7 +33,7 @@ Three things have to line up before Anthropic bills a request to your plan: a va
 
 Anthropic rejects requests that carry someone else's system prompt next to the Claude Code identity, so the extension moves Pi's system prompt into your first message. Your instructions still reach the model.
 
-Part of the header uses a simplified scheme that works because Anthropic does not check it today. If that changes, requests will fail until this extension ships a fix.
+The billing header also carries a `cch` checksum that Claude Code computes over the request body. This extension computes it the same way Claude Code does — a seeded hash of the normalized, serialized body, applied after Pi serializes the request — so the request matches real Claude Code traffic even if Anthropic starts checking the value. It only applies to your subscription (OAuth) login; plain API-key requests pass through unchanged.
 
 ### Staying on the current version
 

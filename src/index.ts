@@ -9,8 +9,9 @@ import {
 } from "./claude-version.ts";
 import { initLogger, log } from "./logger.ts";
 import { registerRetryAfterRefusal } from "./retry-refusal.ts";
-import { buildUserAgent, FALLBACK_CC_VERSION } from "./signing.ts";
-import { injectBillingHeader } from "./transforms.ts";
+import { builtinProviders } from "@earendil-works/pi-ai/providers/all";
+import { wrapAnthropicProvider } from "./anthropic-provider.ts";
+import { FALLBACK_CC_VERSION } from "./signing.ts";
 
 const PROVIDER_ID = "anthropic";
 
@@ -69,8 +70,8 @@ function showVersionAlert(
  *
  * Pi's built-in `anthropic` provider owns the full OAuth lifecycle (browser
  * login, token refresh, credential storage in `~/.pi/agent/auth.json`) and the
- * Claude Code identity prompt. This extension adds only the pieces pi's
- * provider does not send, so requests bill against the Claude Pro/Max
+ * Claude Code identity prompt. This extension wraps that provider so requests
+ * bill against the Claude Pro/Max
  * subscription plan instead of pay-as-you-go API credits or "extra usage":
  *
  * - Sets the full Claude Code user-agent (`claude-cli/<version> (external, …)`)
@@ -79,6 +80,9 @@ function showVersionAlert(
  * - Injects the `x-anthropic-billing-header` system block on every request and
  *   relocates pi's own system prompt into the first user message (Anthropic
  *   rejects third-party system prompts alongside the Claude Code identity).
+ * - Resolves the `cch` body checksum with a seeded XXH64 digest of the
+ *   normalized, serialized request body (via a wrapped `fetch`), matching
+ *   Claude Code 2.1.224 so requests stay valid even if Anthropic enforces cch.
  * - Handles Anthropic Fable 5 and Opus 5 classifier refusals with an
  *   interactive branch-or-continue workflow.
  *
@@ -92,12 +96,18 @@ const extension = async (pi: ExtensionAPI): Promise<void> => {
 	initLogger();
 	const versionResolution = await initializeClaudeCodeVersion();
 
-	// Register only the Claude Code user-agent header. No `oauth` field: pi's
-	// built-in anthropic OAuth provider must stay registered so `/login
+	// Wrap pi's built-in anthropic provider (preserving its OAuth lifecycle) so
+	// OAuth requests carry the Claude Code billing header, identity headers, and
+	// a real cch body checksum. No `oauth` field is registered, so `/login
 	// anthropic` keeps doing the real browser flow and writing auth.json.
-	pi.registerProvider(PROVIDER_ID, {
-		headers: { "user-agent": buildUserAgent() },
-	});
+	const anthropic = builtinProviders().find(
+		(provider) => provider.id === PROVIDER_ID,
+	);
+	if (!anthropic)
+		throw new Error(
+			"pi-claude-auth could not load pi's built-in Anthropic provider",
+		);
+	pi.registerProvider(wrapAnthropicProvider(anthropic));
 
 	registerRetryAfterRefusal(pi);
 
@@ -108,23 +118,6 @@ const extension = async (pi: ExtensionAPI): Promise<void> => {
 		if (event.reason === "startup") {
 			showVersionAlert(ctx, versionResolution);
 		}
-	});
-
-	// Inject the Claude Code billing header so requests bill against the
-	// Claude Pro/Max subscription rather than pay-as-you-go API credits.
-	pi.on("before_provider_request", (event) => {
-		try {
-			const updated = injectBillingHeader(event.payload);
-			if (updated) {
-				log("billing_header_injected", {});
-				return updated;
-			}
-		} catch (err) {
-			log("billing_header_error", {
-				error: err instanceof Error ? err.message : String(err),
-			});
-		}
-		return undefined;
 	});
 
 	log("provider_registered", { provider: PROVIDER_ID });

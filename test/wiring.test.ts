@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { Provider } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import loadExtension from "../src/index.ts";
 
@@ -10,34 +11,23 @@ const originalFetch = globalThis.fetch;
 type Handler = (...args: unknown[]) => unknown;
 
 interface SpyPi {
-	registerProviderCalls: { name: string; config: Record<string, unknown> }[];
+	registeredProviders: Provider[];
 	handlers: Record<string, Handler[]>;
 }
 
-function makeSpyPi(): SpyPi & {
-	registerProvider(name: string, config: Record<string, unknown>): void;
-	registerCommand(name: string, options: unknown): void;
-	sendMessage(): void;
-	sendUserMessage(): void;
-	setModel(): Promise<boolean>;
-	on(event: string, handler: Handler): void;
-} {
-	const registerProviderCalls: {
-		name: string;
-		config: Record<string, unknown>;
-	}[] = [];
+function makeSpyPi(): SpyPi &
+	Partial<ExtensionAPI> & {
+		registerProvider(provider: Provider): void;
+		on(event: string, handler: Handler): void;
+	} {
+	const registeredProviders: Provider[] = [];
 	const handlers: Record<string, Handler[]> = {};
 	return {
-		registerProviderCalls,
+		registeredProviders,
 		handlers,
-		registerProvider(name, config) {
-			registerProviderCalls.push({ name, config });
-		},
-		registerCommand() {},
-		sendMessage() {},
-		sendUserMessage() {},
-		async setModel() {
-			return true;
+		// The extension calls the single-arg `registerProvider(provider)` overload.
+		registerProvider(provider: Provider) {
+			registeredProviders.push(provider);
 		},
 		on(event, handler) {
 			handlers[event] ??= [];
@@ -64,30 +54,30 @@ describe("extension wiring (Pi owns the OAuth lifecycle)", () => {
 		globalThis.fetch = originalFetch;
 	});
 
-	it("registers the anthropic provider with headers and NO custom oauth lifecycle", async () => {
+	it("wraps pi's built-in anthropic provider (preserving its OAuth lifecycle)", async () => {
 		// No auth.json present: the user has not logged in yet. The extension
-		// must still register the provider so `/login anthropic` (Pi's built-in
-		// browser flow) is available.
+		// must still register the wrapped provider so `/login anthropic`
+		// (pi's built-in browser flow, inherited from the spread) is available.
 		const spy = makeSpyPi();
 		await loadExtension(spy as unknown as ExtensionAPI);
 
-		const reg = spy.registerProviderCalls.find((c) => c.name === "anthropic");
-		expect(reg).toBeDefined();
-		// The whole point: the extension must NOT shadow Pi's built-in OAuth
-		// provider. A registered `oauth` field would overwrite it.
-		expect(reg?.config.oauth).toBeUndefined();
-		expect(reg?.config.headers).toBeDefined();
-		const ua = (reg?.config.headers as Record<string, unknown>)["user-agent"];
-		expect(typeof ua).toBe("string");
-		expect(ua as string).toContain("claude-cli/");
+		expect(spy.registeredProviders).toHaveLength(1);
+		const anthropic = spy.registeredProviders[0];
+		expect(anthropic.id).toBe("anthropic");
+		// The wrap overrides stream/streamSimple; identity + credential config
+		// are inherited from the built-in spread, so /login is untouched.
+		expect(anthropic.stream).not.toBeUndefined();
+		expect(anthropic.streamSimple).not.toBeUndefined();
 	});
 
-	it("registers before_provider_request and session_start hooks even when logged out", async () => {
+	it("registers session_start hooks and no before_provider_request hook", async () => {
+		// Billing injection now lives in the wrapped provider's onPayload, so the
+		// before_provider_request hook is intentionally gone.
 		const spy = makeSpyPi();
 		await loadExtension(spy as unknown as ExtensionAPI);
 
-		expect(spy.handlers.before_provider_request?.length).toBeGreaterThan(0);
 		expect(spy.handlers.session_start?.length).toBeGreaterThan(0);
+		expect(spy.handlers.before_provider_request).toBeUndefined();
 	});
 
 	it("does not write to auth storage on session_start (Pi owns auth.json)", async () => {
