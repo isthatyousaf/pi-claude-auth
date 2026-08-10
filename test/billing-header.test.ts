@@ -125,14 +125,57 @@ describe("injectBillingHeader", () => {
 			};
 			const out = injectBillingHeader(payload) as {
 				system: { text: string }[];
-				messages: { role: string; content: string }[];
+				messages: {
+					role: string;
+					content: Array<{ type: string; text: string }>;
+				}[];
 			};
 			expect(out.system.length).toBe(2);
 			const firstUser = out.messages.find((m) => m.role === "user");
 			expect(firstUser).toBeDefined();
 			if (!firstUser) return;
-			expect(firstUser.content).toContain("Extra system instructions.");
-			expect(firstUser.content).toContain("Hello there.");
+			expect(firstUser.content.map((block) => block.text)).toEqual([
+				"Extra system instructions.",
+				"Hello there.",
+			]);
+		});
+
+		it("preserves one-hour cache controls while relocating system text", () => {
+			const oneHour = { type: "ephemeral", ttl: "1h" };
+			const payload = {
+				model: "claude-sonnet-4-5",
+				system: [
+					{
+						type: "text",
+						text: LEGACY_IDENTITY,
+						cache_control: oneHour,
+					},
+					{
+						type: "text",
+						text: "Stable Pi system prompt.",
+						cache_control: oneHour,
+					},
+				],
+				messages: [{ role: "user", content: "Hello." }],
+			};
+
+			const out = injectBillingHeader(payload) as {
+				system: Array<{ text: string; cache_control?: typeof oneHour }>;
+				messages: Array<{
+					content: Array<{
+						text: string;
+						cache_control?: typeof oneHour;
+					}>;
+				}>;
+			};
+
+			expect(out.system[0].cache_control).toBeUndefined();
+			expect(out.system[1].cache_control).toEqual(oneHour);
+			expect(out.messages[0].content[0]).toEqual({
+				type: "text",
+				text: "Stable Pi system prompt.",
+				cache_control: oneHour,
+			});
 		});
 	});
 });
