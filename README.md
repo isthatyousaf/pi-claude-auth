@@ -76,6 +76,7 @@ The extension steps in once the refusal has fully arrived. A stream that hangs i
 | `ANTHROPIC_USER_AGENT` | Override the whole user-agent string. |
 | `PI_CLAUDE_AUTH_DEBUG` | Set `1` to write diagnostics to `~/.pi/agent/pi-claude-auth-debug.log`. The log redacts secrets. |
 | `PI_CLAUDE_AUTH_REFUSAL_MODE` | Refusal policy for Fable 5 and Opus 5: `ask` (default) or `auto`. |
+| `ENABLE_PROMPT_CACHING_1H` | Set `1`, `true`, `yes`, or `on` to use Claude Code's one-hour prompt-cache TTL for subscription requests. This overrides short retention. Pi's equivalent process-wide setting is `PI_CACHE_RETENTION=long`. |
 
 ## Credits
 

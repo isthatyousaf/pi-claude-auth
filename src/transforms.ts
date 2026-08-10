@@ -13,7 +13,12 @@ const LEGACY_IDENTITY =
 const AGENT_SDK_IDENTITY =
 	"You are a Claude agent, built on Anthropic's Claude Agent SDK.";
 
-type SystemEntry = { type?: string; text?: string } & Record<string, unknown>;
+type CacheControl = { type?: unknown; ttl?: unknown } & Record<string, unknown>;
+type SystemEntry = {
+	type?: string;
+	text?: string;
+	cache_control?: CacheControl;
+} & Record<string, unknown>;
 
 interface AnthropicPayload {
 	model?: unknown;
@@ -84,27 +89,54 @@ export function injectBillingHeader(
 	);
 
 	// Drop pi's legacy identity and relocate every other system block (pi's real
-	// prompt, etc.) into the first user message.
-	const movedTexts: string[] = [];
+	// prompt, etc.) into the first user message. Preserve Pi's cache breakpoints:
+	// the identity marker moves to the replacement identity, while the final
+	// relocated system marker moves with the combined prompt prefix.
+	const legacyIdentity = system.find(
+		(entry) => entryText(entry) === LEGACY_IDENTITY,
+	);
+	const identityCacheControl = legacyIdentity?.cache_control;
+	const movedEntries: Array<{ text: string; cacheControl?: CacheControl }> = [];
 	for (const entry of system) {
 		const txt = entryText(entry);
-		if (txt.length > 0 && txt !== LEGACY_IDENTITY) movedTexts.push(txt);
+		if (txt.length > 0 && txt !== LEGACY_IDENTITY) {
+			movedEntries.push({ text: txt, cacheControl: entry.cache_control });
+		}
 	}
 
 	p.system = [
 		{ type: "text", text: billingHeader },
-		{ type: "text", text: AGENT_SDK_IDENTITY },
+		{
+			type: "text",
+			text: AGENT_SDK_IDENTITY,
+			...(identityCacheControl
+				? { cache_control: identityCacheControl }
+				: {}),
+		},
 	];
 
-	if (movedTexts.length > 0) {
+	if (movedEntries.length > 0) {
 		const firstUser = messages.find((m) => m.role === "user");
 		if (firstUser) {
-			const prefix = movedTexts.join("\n\n");
+			const prefix = movedEntries.map((entry) => entry.text).join("\n\n");
+			const prefixCacheControl = movedEntries.findLast(
+				(entry) => entry.cacheControl !== undefined,
+			)?.cacheControl;
+			const prefixBlock = {
+				type: "text",
+				text: prefix,
+				...(prefixCacheControl
+					? { cache_control: prefixCacheControl }
+					: {}),
+			};
 			const content = firstUser.content;
 			if (typeof content === "string") {
-				firstUser.content = `${prefix}\n\n${content}`;
+				firstUser.content = [
+					prefixBlock,
+					{ type: "text", text: content },
+				];
 			} else if (Array.isArray(content)) {
-				content.unshift({ type: "text", text: prefix });
+				content.unshift(prefixBlock);
 			}
 		}
 	}

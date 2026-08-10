@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it } from "bun:test";
 import type { Provider } from "@earendil-works/pi-ai";
 import { wrapAnthropicProvider } from "../src/anthropic-provider.ts";
 
@@ -31,6 +31,10 @@ function recordingAnthropicProvider(): Provider & {
 }
 
 describe("wrapAnthropicProvider", () => {
+	afterEach(() => {
+		delete process.env.ENABLE_PROMPT_CACHING_1H;
+	});
+
 	it("rejects a non-anthropic provider", () => {
 		expect(() =>
 			wrapAnthropicProvider({ id: "openai" } as Provider),
@@ -129,5 +133,33 @@ describe("wrapAnthropicProvider", () => {
 		const merged = fake.calls[0].options as Record<string, unknown>;
 		expect((merged.headers as Record<string, string>)["x-app"]).toBe("cli");
 		expect(typeof merged.onPayload).toBe("function");
+	});
+
+	it("maps Claude Code's one-hour cache env var to Pi's long retention", () => {
+		process.env.ENABLE_PROMPT_CACHING_1H = "1";
+		const fake = recordingAnthropicProvider();
+		const wrapped = wrapAnthropicProvider(fake);
+
+		wrapped.stream({} as never, {} as never, {
+			apiKey: "sk-ant-oat-xyz",
+			cacheRetention: "short",
+		} as never);
+
+		const merged = fake.calls[0].options as Record<string, unknown>;
+		expect(merged.cacheRetention).toBe("long");
+	});
+
+	it("does not change cache retention when the env var is disabled", () => {
+		process.env.ENABLE_PROMPT_CACHING_1H = "0";
+		const fake = recordingAnthropicProvider();
+		const wrapped = wrapAnthropicProvider(fake);
+
+		wrapped.stream({} as never, {} as never, {
+			apiKey: "sk-ant-oat-xyz",
+			cacheRetention: "short",
+		} as never);
+
+		const merged = fake.calls[0].options as Record<string, unknown>;
+		expect(merged.cacheRetention).toBe("short");
 	});
 });

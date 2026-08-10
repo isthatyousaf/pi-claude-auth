@@ -28,6 +28,12 @@ function claudeCodeHeaders(sessionId: string | undefined): ProviderHeaders {
 	};
 }
 
+/** Claude Code-compatible opt-in for Anthropic's one-hour prompt-cache TTL. */
+function oneHourCacheEnabled(): boolean {
+	const value = process.env.ENABLE_PROMPT_CACHING_1H?.trim().toLowerCase();
+	return value === "1" || value === "true" || value === "yes" || value === "on";
+}
+
 /**
  * Merge Claude Code billing behavior into a single stream request's options.
  *
@@ -46,6 +52,9 @@ function mergeClaudeCodeOptions<T extends StreamOptions>(options: T): T {
 	const transport = options.fetch ?? globalThis.fetch;
 	return {
 		...options,
+		// Claude Code uses ENABLE_PROMPT_CACHING_1H to force ttl="1h". Pi's
+		// Anthropic provider maps cacheRetention="long" to the same wire shape.
+		...(oneHourCacheEnabled() ? { cacheRetention: "long" } : {}),
 		headers: { ...options.headers, ...claudeCodeHeaders(options.sessionId) },
 		fetch: createClaudeCodeFetch(transport),
 		onPayload: async (payload, model) => {
