@@ -13,6 +13,7 @@ import {
 	type SessionBeforeCompactEvent,
 	type SessionEntry,
 	type SessionProjection,
+	sessionEntryToContextMessages,
 } from "@earendil-works/pi-coding-agent";
 import { isAnthropicOAuthToken } from "./cch.ts";
 import { log } from "./logger.ts";
@@ -32,6 +33,13 @@ import { log } from "./logger.ts";
  * a kept turn. After a server compaction the prompt therefore goes to an
  * anchor: a fixed point right after the kept turns of the compaction that
  * placed it, the same on every later request and after a resume.
+ *
+ * The compaction request is the last agent request of the session, cut at the
+ * first kept message. Pi's final request projection (hidden declarations, a
+ * forced prompt, other extensions' context handlers) is not available to
+ * extensions, so the request is taken from what was actually sent, and
+ * compaction falls back to Pi's summary whenever later requests could not
+ * continue it unchanged.
  */
 
 export const COMPACT_BETA = "compact-2026-09-04";
@@ -320,6 +328,59 @@ function moveAnchorPastToolResults(messages: WireMessage[], index: number): void
 }
 
 // ---------------------------------------------------------------------------
+// Last agent request
+// ---------------------------------------------------------------------------
+
+/** What the last agent request of a session sent, before this extension's payload transforms. */
+export interface AgentRequestRecord {
+	modelId: string;
+	messages: readonly Message[];
+	/** `tools` and `system` of the payload, compared by {@link payloadDeclarationsKey}. */
+	declarationsKey: string;
+	cacheRetention?: unknown;
+}
+
+// Pi emits before_provider_request only for agent requests. Its handler marks
+// the payload, and the overlay records the request when it sees that payload.
+const agentPayloads = new WeakSet<object>();
+const agentRequests = new Map<string, AgentRequestRecord>();
+
+export function markAgentPayload(payload: unknown): void {
+	if (payload && typeof payload === "object") agentPayloads.add(payload);
+}
+
+export function isAgentPayload(payload: unknown): boolean {
+	return !!payload && typeof payload === "object" && agentPayloads.has(payload);
+}
+
+/**
+ * Declarations a compaction request must share with the agent requests around
+ * it. Cache breakpoints are left out: they do not change the prompt, and the
+ * compaction request may use a different cache retention.
+ */
+export function payloadDeclarationsKey(payload: unknown): string {
+	const p = (payload ?? {}) as WirePayload;
+	return JSON.stringify({ tools: p.tools ?? null, system: p.system ?? null }, (key, value) =>
+		key === "cache_control" ? undefined : value,
+	);
+}
+
+export function recordAgentRequest(
+	sessionId: string | undefined,
+	record: AgentRequestRecord,
+): void {
+	if (sessionId) agentRequests.set(sessionId, record);
+}
+
+export function lastAgentRequest(sessionId: string): AgentRequestRecord | undefined {
+	return agentRequests.get(sessionId);
+}
+
+export function forgetAgentRequests(): void {
+	agentRequests.clear();
+}
+
+// ---------------------------------------------------------------------------
 // Anchor placement in the session
 // ---------------------------------------------------------------------------
 
@@ -329,25 +390,54 @@ function moveAnchorPastToolResults(messages: WireMessage[], index: number): void
  *
  * Each server compaction places its anchor right after itself in the session
  * path, which in the projection is right after its kept turns. A later server
- * compaction that keeps the active anchor's compaction keeps that anchor:
- * requests since then carried the system text there. A Pi summary resets the
- * chain, since the requests after it carried the system text in that summary.
+ * compaction keeps the active anchor when the anchor stays on its kept side:
+ * when it keeps the active anchor's compaction, or when its first kept entry
+ * is the first message after that compaction and the message before the
+ * anchor is not a user message (the anchor joins the turn it shares a wire
+ * role with). Requests since then carried the system text there. A Pi summary
+ * resets the chain, since the requests after it carried the system text in
+ * that summary.
  */
 export function findAnchorIndex(
 	branch: readonly SessionEntry[],
 	projection: SessionProjection,
 ): number | undefined {
 	const pathIndex = new Map(branch.map((entry, index) => [entry.id, index]));
+	const visibleMessages = (entry: SessionEntry) =>
+		entry.type === "compaction"
+			? []
+			: (convertToLlm(sessionEntryToContextMessages(entry) as never) as Message[]).filter(
+					(message) => message.role !== "system",
+				);
+	const messagesBetween = (from: number, to: number) =>
+		branch.slice(from + 1, to).some((entry) => visibleMessages(entry).length > 0);
+	// Wire role of the last message in [from, to), or of the summary block before it.
+	const lastWireRole = (from: number, to: number) => {
+		for (let i = to - 1; i >= from; i--) {
+			const last = visibleMessages(branch[i]).at(-1);
+			if (last) return last.role === "assistant" ? "assistant" : "user";
+		}
+		return "assistant";
+	};
 	let active: SessionEntry | undefined;
+	let newestFirstKept = 0;
 	for (const entry of branch) {
 		if (entry.type !== "compaction") continue;
+		const firstKept = pathIndex.get(entry.firstKeptEntryId);
+		const previousFirstKept = newestFirstKept;
+		newestFirstKept = firstKept ?? newestFirstKept;
 		if (!blockFromEntry(entry)) {
 			active = undefined;
 			continue;
 		}
-		const firstKept = pathIndex.get(entry.firstKeptEntryId);
 		const activeIndex = active ? pathIndex.get(active.id) : undefined;
-		if (activeIndex !== undefined && firstKept !== undefined && activeIndex >= firstKept)
+		if (
+			activeIndex !== undefined &&
+			firstKept !== undefined &&
+			(activeIndex >= firstKept ||
+				(!messagesBetween(activeIndex, firstKept) &&
+					lastWireRole(previousFirstKept, activeIndex) !== "user"))
+		)
 			continue;
 		active = entry;
 	}
@@ -514,40 +604,152 @@ function isAnthropicEffort(value: unknown): value is string {
 	);
 }
 
-/**
- * The messages of the compaction request: the request Pi would send, cut at
- * the first kept entry, with the active anchor when it lies before the cut.
- * `keptAssistantEffort` is set when the kept part starts with an assistant
- * message whose effort pi-ai marks: the request then ends with that marker, so
- * it equals the request that produced the kept message.
- */
-export function buildCompactionRequestMessages(
-	projection: SessionProjection,
-	firstKeptEntryId: string,
-	anchorIndex: number | undefined,
-	provider: string,
-): { messages: unknown[]; keptAssistantEffort?: string } | undefined {
-	const cut = projection.entries.findIndex((entry) => entry.sourceEntry.id === firstKeptEntryId);
-	if (cut <= 0) return undefined;
-	const messages: unknown[] = projection.entries.slice(0, cut).flatMap((entry) => entry.messages);
-	if (anchorIndex !== undefined && anchorIndex <= cut) {
-		const offset = projection.entries
-			.slice(0, anchorIndex)
-			.reduce((count, entry) => count + entry.messages.length, 0);
-		const before = messages[offset - 1] as TimedMessage | undefined;
-		messages.splice(offset, 0, createAnchorMessage(before?.timestamp ?? Date.now()));
+function isAnchorMessage(message: { role?: string; content?: unknown }): boolean {
+	return (
+		message.role === "user" && Array.isArray(message.content) && message.content.some(isAnchorBlock)
+	);
+}
+
+/** Whether a system message changes anything on the wire. */
+function changesSystem(message: Message): boolean {
+	if (message.role !== "system") return false;
+	const m = message as Message & {
+		sections?: Record<string, unknown>;
+		toolsAdded?: unknown[];
+		toolsRemoved?: unknown[];
+	};
+	const text =
+		typeof m.content === "string"
+			? m.content
+			: (m.content as Array<{ text?: string }>).map((block) => block.text ?? "").join("");
+	return (
+		text.length > 0 ||
+		Object.keys(m.sections ?? {}).length > 0 ||
+		(m.toolsAdded?.length ?? 0) > 0 ||
+		(m.toolsRemoved?.length ?? 0) > 0
+	);
+}
+
+function changesTools(message: Message): boolean {
+	const m = message as { role: string; toolsAdded?: unknown[]; toolsRemoved?: unknown[] };
+	return m.role === "system" && ((m.toolsAdded?.length ?? 0) > 0 || (m.toolsRemoved?.length ?? 0) > 0);
+}
+
+/** The role a message takes on the wire, where a known summary becomes the assistant block. */
+function wireRole(message: Message, model: string): string {
+	if (message.role === "toolResult") return "user";
+	if (message.role === "user") {
+		const text = messageText(message);
+		if (text !== undefined && supportsServerCompaction(model) && blocksBySummaryText.has(text))
+			return "assistant";
 	}
-	const kept = projection.entries[cut]?.messages[0] as
+	return message.role;
+}
+
+/**
+ * Index of the one message of `messages` that is `target`, by role and
+ * timestamp, and by content when the timestamp is shared (a compaction summary
+ * and the prompt right after it can share one).
+ */
+function indexOfMessage(messages: readonly Message[], target: Message): number {
+	const candidates: number[] = [];
+	messages.forEach((m, i) => {
+		if (m.role === target.role && m.timestamp === target.timestamp && !isAnchorMessage(m))
+			candidates.push(i);
+	});
+	if (candidates.length <= 1) return candidates[0] ?? -1;
+	const content = JSON.stringify(target.content);
+	const same = candidates.filter((i) => JSON.stringify(messages[i].content) === content);
+	return same.length === 1 ? same[0] : -1;
+}
+
+export type CompactionRequestMessages =
+	| { ok: true; messages: Message[]; keptAssistantEffort?: string }
+	| { ok: false; reason: string };
+
+/**
+ * The messages of the compaction request: the last agent request, cut right
+ * after the last summarized message. Fails whenever the agent requests after
+ * the compaction could not continue that request unchanged:
+ *
+ * - the last request does not hold the summarized messages, or other messages
+ *   than an anchor lie at the cut;
+ * - the cut separates two messages of the same wire role, which earlier
+ *   requests sent as one turn;
+ * - tools changed during the session: Pi's compaction entry declares the
+ *   current tools up front, while the compaction request declared the
+ *   original tools and the changes inline;
+ * - a system message would reach the wire next to the kept turns: Pi drops
+ *   system messages from the kept part.
+ *
+ * An anchor at the cut joins the side it shares a wire role with: the
+ * summarized side after a user message, else the kept side, where
+ * {@link findAnchorIndex} keeps it. `keptAssistantEffort` is set when the kept
+ * part starts with an assistant message whose effort pi-ai marks: the request
+ * then ends with that marker, so it equals the request that produced it.
+ */
+export function buildCompactionRequestMessages(options: {
+	request: readonly Message[];
+	projection: SessionProjection;
+	firstKeptEntryId: string;
+	model: string;
+	provider: string;
+}): CompactionRequestMessages {
+	const { request, projection, model } = options;
+	const fail = (reason: string): CompactionRequestMessages => ({ ok: false, reason });
+	const cut = projection.entries.findIndex(
+		(entry) => entry.sourceEntry.id === options.firstKeptEntryId,
+	);
+	if (cut <= 0) return fail("first kept entry not found");
+	const visible = (entries: typeof projection.entries) =>
+		(convertToLlm(entries.flatMap((entry) => entry.messages) as never) as Message[]).filter(
+			(message) => message.role !== "system",
+		);
+	const lastSummarized = visible(projection.entries.slice(0, cut)).at(-1);
+	const firstKept = visible(projection.entries.slice(cut))[0];
+	if (!lastSummarized) return fail("nothing to summarize");
+
+	const lastIndex = indexOfMessage(request, lastSummarized);
+	if (lastIndex < 0) return fail("the last request does not hold the summarized messages");
+	const keptIndex = firstKept ? indexOfMessage(request, firstKept) : -1;
+	if (keptIndex >= 0 && keptIndex <= lastIndex) return fail("the last request has another order");
+	const end = keptIndex >= 0 ? keptIndex : request.length;
+	const between = request.slice(lastIndex + 1, end);
+	if (between.some((message) => message.role !== "system" && !isAnchorMessage(message)))
+		return fail("unexpected messages at the cut");
+
+	const lastRole = wireRole(request[lastIndex], model);
+	const anchorOffset = between.findIndex(isAnchorMessage);
+	const anchorSummarized = anchorOffset >= 0 && lastRole === "user";
+	const anchorKept = anchorOffset >= 0 && !anchorSummarized;
+	const cutIndex = anchorSummarized ? lastIndex + anchorOffset + 2 : lastIndex + 1;
+	const nextRole = anchorKept ? "user" : firstKept ? wireRole(firstKept, model) : undefined;
+	if (nextRole === lastRole) return fail("the cut splits a turn");
+
+	for (let i = 1; i < request.length; i++) {
+		const message = request[i];
+		if (changesTools(message)) return fail("tools changed during the session");
+		if (!changesSystem(message)) continue;
+		// pi-ai sends a later system message right before the next assistant message.
+		const next = request.findIndex((m, j) => j > i && m.role === "assistant");
+		if (next < 0 || next >= cutIndex) return fail("the system prompt changed in the kept turns");
+	}
+
+	const kept = (anchorKept ? undefined : firstKept) as
 		| { role?: string; api?: string; provider?: string; providerThinkingLevel?: unknown }
 		| undefined;
 	const keptAssistantEffort =
 		kept?.role === "assistant" &&
 		kept.api === "anthropic-messages" &&
-		kept.provider === provider &&
+		kept.provider === options.provider &&
 		isAnthropicEffort(kept.providerThinkingLevel)
 			? kept.providerThinkingLevel
 			: undefined;
-	return { messages, ...(keptAssistantEffort ? { keptAssistantEffort } : {}) };
+	return {
+		ok: true,
+		messages: request.slice(0, cutIndex),
+		...(keptAssistantEffort ? { keptAssistantEffort } : {}),
+	};
 }
 
 interface CompactionIteration {
@@ -594,6 +796,9 @@ export async function requestServerCompaction(options: {
 	messages: Message[];
 	keptAssistantEffort?: string;
 	instructions: string;
+	/** {@link payloadDeclarationsKey} of the last agent request; a mismatch aborts the request. */
+	declarationsKey?: string;
+	cacheRetention?: unknown;
 	signal?: AbortSignal;
 }): Promise<CompactionOutcome> {
 	let block: CompactionBlock | undefined;
@@ -612,10 +817,16 @@ export async function requestServerCompaction(options: {
 			...(options.headers ? { headers: options.headers } : {}),
 			...(options.sessionId ? { sessionId: options.sessionId } : {}),
 			...(reasoning ? { reasoning } : {}),
+			...(options.cacheRetention !== undefined ? { cacheRetention: options.cacheRetention } : {}),
 			signal: options.signal,
 			disableContinuation: true,
 			onPayload: (params: unknown) => {
 				const p = params as WirePayload;
+				if (
+					options.declarationsKey !== undefined &&
+					payloadDeclarationsKey(p) !== options.declarationsKey
+				)
+					throw new Error("tools or system prompt differ from the last request");
 				const messages = p.messages as WireMessage[] | undefined;
 				if (Array.isArray(messages) && isEffortMarker(messages.at(-1))) {
 					const marker = messages.at(-1) as WireMessage;
@@ -686,22 +897,24 @@ async function compactOnServer(event: SessionBeforeCompactEvent, ctx: ExtensionC
 		log("server_compaction_fallback", { reason });
 		if (ctx.hasUI && reason !== "aborted")
 			ctx.ui.notify(
-				`Anthropic compaction did not return a summary (${reason.slice(0, 200)}). Using Pi's summary instead.`,
+				`Anthropic compaction not used (${reason.slice(0, 200)}). Using Pi's summary instead.`,
 				"warning",
 			);
 		return undefined;
 	};
 
+	const last = lastAgentRequest(ctx.sessionManager.getSessionId());
+	if (!last || last.modelId !== model.id)
+		return fallback(`no earlier request to ${model.id} in this session since Pi started`);
 	rememberCompactionBlocks(event.branchEntries);
-	const projection = buildSessionProjection(event.branchEntries);
-	const anchorIndex = findAnchorIndex(event.branchEntries, projection);
-	const request = buildCompactionRequestMessages(
-		projection,
-		preparation.firstKeptEntryId,
-		anchorIndex,
-		model.provider,
-	);
-	if (!request) return fallback("first kept entry not found");
+	const request = buildCompactionRequestMessages({
+		request: last.messages,
+		projection: buildSessionProjection(event.branchEntries),
+		firstKeptEntryId: preparation.firstKeptEntryId,
+		model: model.id,
+		provider: model.provider,
+	});
+	if (!request.ok) return fallback(request.reason);
 
 	const { readFiles, modifiedFiles } = fileLists(preparation.fileOps);
 	const attempt = async (instructions: string): Promise<CompactionOutcome> => {
@@ -713,9 +926,11 @@ async function compactOnServer(event: SessionBeforeCompactEvent, ctx: ExtensionC
 				headers: auth.headers as Record<string, string> | undefined,
 				sessionId: ctx.sessionManager.getSessionId(),
 				reasoning: ctx.thinkingLevel,
-				messages: convertToLlm(request.messages as never),
+				messages: request.messages,
 				keptAssistantEffort: request.keptAssistantEffort,
 				instructions,
+				declarationsKey: last.declarationsKey,
+				cacheRetention: last.cacheRetention,
 				signal: event.signal,
 			});
 		} catch (err) {
@@ -795,6 +1010,9 @@ export function registerServerCompaction(pi: ExtensionAPI): void {
 	});
 	pi.on("session_compact", (event) => {
 		rememberCompactionBlocks([event.compactionEntry]);
+	});
+	pi.on("before_provider_request", (event) => {
+		markAgentPayload(event.payload);
 	});
 	pi.on("session_before_compact", async (event, ctx) => {
 		try {

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import type { Api, Model } from "@earendil-works/pi-ai";
+import type { Api, Message, Model } from "@earendil-works/pi-ai";
 import {
 	buildSessionProjection,
 	convertToLlm,
@@ -15,9 +15,12 @@ import {
 	type CompactionBlock,
 	contextCarriesCompactionBlock,
 	findAnchorIndex,
+	forgetAgentRequests,
 	forgetCompactionBlocks,
 	insertAnchor,
 	markCompactionRequestPayload,
+	payloadDeclarationsKey,
+	recordAgentRequest,
 	registerServerCompaction,
 	rememberCompactionBlock,
 	requestServerCompaction,
@@ -71,6 +74,7 @@ afterEach(() => {
 	delete process.env.ANTHROPIC_CLI_VERSION;
 	delete process.env.PI_CLAUDE_AUTH_SERVER_COMPACTION;
 	forgetCompactionBlocks();
+	forgetAgentRequests();
 });
 
 describe("summary message text", () => {
@@ -282,6 +286,24 @@ const assistant = (id: string, effort = "high") => ({
 		timestamp: clock++,
 	},
 });
+const toolCallAssistant = (id: string) => {
+	const entry = assistant(id);
+	entry.message.content = [{ type: "toolCall", id: "call_" + id, name: "read", arguments: {} }] as never;
+	(entry.message as { stopReason: string }).stopReason = "toolUse";
+	return entry;
+};
+const toolResult = (id: string, callId: string) => ({
+	type: "message",
+	id,
+	message: {
+		role: "toolResult",
+		toolCallId: "call_" + callId,
+		toolName: "read",
+		content: [{ type: "text", text: "result " + id }],
+		isError: false,
+		timestamp: clock++,
+	},
+});
 const serverCompaction = (id: string, firstKeptEntryId: string, summary = BLOCK.content) => ({
 	type: "compaction",
 	id,
@@ -343,11 +365,39 @@ describe("findAnchorIndex", () => {
 		const branch = entries(
 			sys("s"), user("u1"), assistant("a1"), user("u2"), assistant("a2"),
 			serverCompaction("c1", "u2", "first"), user("u3"), assistant("a3"),
-			serverCompaction("c2", "u3", "second"), user("u4"),
+			serverCompaction("c2", "a3", "second"), user("u4"),
 		);
 		const projection = buildSessionProjection(branch);
 		const index = findAnchorIndex(branch, projection) as number;
 		expect(ids(projection, index)).toEqual(["u4"]);
+	});
+
+	it("keeps the active anchor when the cut lands right after it", () => {
+		// c2 keeps u3, the first message after c1, so c1's anchor sits right
+		// before the kept part: earlier requests sent it and u3 as one user turn.
+		const branch = entries(
+			sys("s"), user("u1"), assistant("a1"), user("u2"), assistant("a2"),
+			serverCompaction("c1", "u2", "first"), { type: "thinking_level_change", id: "t", thinkingLevel: "low" },
+			user("u3"), assistant("a3"),
+			serverCompaction("c2", "u3", "second"), user("u4"),
+		);
+		const projection = buildSessionProjection(branch);
+		const index = findAnchorIndex(branch, projection) as number;
+		expect(ids(projection, index).filter((id) => id !== "t")).toEqual(["u3", "a3", "u4"]);
+	});
+
+	it("lets a later compaction summarize an anchor that follows tool results", () => {
+		// c1 cut inside a turn after the tool results, so its anchor joins them
+		// in one user turn. c2 keeps the next message, an assistant reply: the
+		// anchor goes to c2's summarized side, and c2 places a new one.
+		const branch = entries(
+			sys("s"), user("u1"), toolCallAssistant("a1"), toolResult("r1", "a1"),
+			serverCompaction("c1", "a1", "first"), assistant("a2"),
+			serverCompaction("c2", "a2", "second"), user("u3"),
+		);
+		const projection = buildSessionProjection(branch);
+		const index = findAnchorIndex(branch, projection) as number;
+		expect(ids(projection, index)).toEqual(["u3"]);
 	});
 
 	it("does not revive an anchor that was never used", () => {
@@ -357,7 +407,7 @@ describe("findAnchorIndex", () => {
 			sys("s"), user("u1"), assistant("a1"), user("u2"), assistant("a2"),
 			serverCompaction("c1", "u2", "first"), user("u3"), assistant("a3"),
 			serverCompaction("c2", "a2", "second"), user("u4"), assistant("a4"),
-			serverCompaction("c3", "u3", "third"), user("u5"),
+			serverCompaction("c3", "a3", "third"), user("u5"),
 		);
 		const projection = buildSessionProjection(branch);
 		const index = findAnchorIndex(branch, projection) as number;
@@ -406,41 +456,148 @@ describe("insertAnchor", () => {
 	});
 });
 
+/** The provider context of an agent request on `branch`, anchored as the context hook does it. */
+function agentRequest(branch: SessionEntry[]) {
+	const projection = buildSessionProjection(branch);
+	const anchorIndex = findAnchorIndex(branch, projection);
+	const messages =
+		anchorIndex === undefined
+			? projection.messages
+			: (insertAnchor(projection.messages as never[], projection, anchorIndex) as never[]);
+	return convertToLlm(messages as never) as Message[];
+}
+
+function build(branch: SessionEntry[], firstKeptEntryId: string, request = agentRequest(branch), provider = "anthropic") {
+	return buildCompactionRequestMessages({
+		request,
+		projection: buildSessionProjection(branch),
+		firstKeptEntryId,
+		model: "claude-haiku-5-5",
+		provider,
+	});
+}
+
+const texts = (messages: readonly unknown[]) =>
+	messages.map((m) => JSON.stringify((m as { content?: unknown }).content ?? ""));
+
 describe("buildCompactionRequestMessages", () => {
-	it("cuts at the first kept entry", () => {
-		const branch = entries(sys("s"), user("u1"), assistant("a1"), user("u2"), assistant("a2"));
-		const request = buildCompactionRequestMessages(buildSessionProjection(branch), "u2", undefined, "anthropic");
-		expect(request?.messages.map((m) => (m as { role: string }).role)).toEqual(["system", "user", "assistant"]);
-		expect(request?.keptAssistantEffort).toBeUndefined();
+	it("cuts the last request right after the last summarized message", () => {
+		const branch = entries(sys("s"), user("u1"), assistant("a1"), user("u2"), assistant("a2"), user("u3"));
+		const request = build(branch, "u2");
+		if (!request.ok) throw new Error(request.reason);
+		expect(request.messages.map((m) => m.role)).toEqual(["system", "user", "assistant"]);
+		expect(request.keptAssistantEffort).toBeUndefined();
 	});
 
-	it("carries the kept assistant's effort when Pi cuts inside a turn", () => {
-		const branch = entries(sys("s"), user("u1"), assistant("a1", "medium"), user("u2"));
-		const projection = buildSessionProjection(branch);
-		expect(buildCompactionRequestMessages(projection, "a1", undefined, "anthropic")?.keptAssistantEffort).toBe("medium");
-		expect(buildCompactionRequestMessages(projection, "a1", undefined, "other")?.keptAssistantEffort).toBeUndefined();
+	it("summarizes the whole last request when the kept part starts with its response", () => {
+		const branch = entries(sys("s"), user("u1"), assistant("a1", "medium"));
+		const lastRequest = agentRequest(branch).slice(0, -1);
+		const request = build(branch, "a1", lastRequest);
+		if (!request.ok) throw new Error(request.reason);
+		expect(request.messages).toEqual(lastRequest);
+		expect(request.keptAssistantEffort).toBe("medium");
+		const other = build(branch, "a1", lastRequest, "other");
+		expect(other.ok && other.keptAssistantEffort).toBeUndefined();
 	});
 
-	it("includes the active anchor when it lies before the cut", () => {
+	it("finds the kept assistant's effort behind invisible entries", () => {
+		const branch = entries(
+			sys("s"), user("u1"), { type: "thinking_level_change", id: "t", thinkingLevel: "medium" },
+			assistant("a1", "medium"), user("u2"),
+		);
+		expect(build(branch, "t")).toMatchObject({ ok: true, keptAssistantEffort: "medium" });
+	});
+
+	it("keeps an active anchor that lies before the cut, as earlier requests sent it", () => {
 		const branch = entries(
 			sys("s"), user("u1"), assistant("a1"), user("u2"), assistant("a2"),
 			serverCompaction("c1", "u2"), user("u3"), assistant("a3"), user("u4"),
 		);
-		const projection = buildSessionProjection(branch);
-		const anchorIndex = findAnchorIndex(branch, projection);
-		const request = buildCompactionRequestMessages(projection, "u4", anchorIndex, "anthropic");
-		const texts = (request?.messages ?? []).map((m) => JSON.stringify((m as { content?: unknown }).content ?? ""));
-		const at = texts.findIndex((t) => t.includes(ANCHOR_TEXT));
-		expect(texts[at - 1]).toContain("a2");
-		expect(texts[at + 1]).toContain("u3");
-
-		const early = buildCompactionRequestMessages(projection, "a2", anchorIndex, "anthropic");
-		expect(JSON.stringify(early?.messages)).not.toContain(ANCHOR_TEXT);
+		const request = build(branch, "u4");
+		if (!request.ok) throw new Error(request.reason);
+		const t = texts(request.messages);
+		const at = t.findIndex((text) => text.includes(ANCHOR_TEXT));
+		expect(t[at - 1]).toContain("a2");
+		expect(t[at + 1]).toContain("u3");
 	});
 
-	it("rejects an unknown cut", () => {
-		const branch = entries(sys("s"), user("u1"));
-		expect(buildCompactionRequestMessages(buildSessionProjection(branch), "missing", undefined, "anthropic")).toBeUndefined();
+	it("leaves an anchor right before the first kept message on the kept side", () => {
+		const branch = entries(
+			sys("s"), user("u1"), assistant("a1"), user("u2"), assistant("a2"),
+			serverCompaction("c1", "u2"), user("u3"), assistant("a3"),
+		);
+		const request = build(branch, "u3");
+		if (!request.ok) throw new Error(request.reason);
+		expect(request.messages.at(-1)?.role).toBe("assistant");
+		expect(JSON.stringify(request.messages)).not.toContain(ANCHOR_TEXT);
+	});
+
+	it("puts an anchor that follows tool results on the summarized side", () => {
+		const branch = entries(
+			sys("s"), user("u1"), toolCallAssistant("a1"), toolResult("r1", "a1"),
+			serverCompaction("c1", "a1"), assistant("a2", "medium"),
+		);
+		const lastRequest = agentRequest(branch).slice(0, -1);
+		expect(lastRequest.at(-1)?.content).toEqual([{ type: "text", text: ANCHOR_TEXT }]);
+		const request = build(branch, "a2", lastRequest);
+		if (!request.ok) throw new Error(request.reason);
+		expect(request.messages).toEqual(lastRequest);
+		expect(request.keptAssistantEffort).toBe("medium");
+	});
+
+	it("tells apart a summary and the prompt that share its timestamp", () => {
+		const branch = entries(
+			sys("s"), user("u1"), assistant("a1"), user("u2"), assistant("a2"),
+			serverCompaction("c1", "u2"), user("u3"), assistant("a3"), user("u4"),
+		);
+		const c1 = branch.find((entry) => entry.id === "c1") as SessionEntry;
+		const u3 = branch.find((entry) => entry.id === "u3") as { message: { timestamp: number } };
+		u3.message.timestamp = Date.parse(c1.timestamp);
+		const request = build(branch, "a3");
+		if (!request.ok) throw new Error(request.reason);
+		expect(texts(request.messages).at(-1)).toContain("u3");
+	});
+
+	it("refuses a cut between two messages of the same wire role", () => {
+		const custom = {
+			type: "custom_message", id: "c", customType: "note", content: "injected", display: false,
+		};
+		const branch = entries(sys("s"), user("u1"), assistant("a1"), user("u2"), custom, assistant("a2"));
+		expect(build(branch, "c")).toEqual({ ok: false, reason: "the cut splits a turn" });
+	});
+
+	it("refuses when tools changed during the session", () => {
+		const change = {
+			type: "message", id: "tc",
+			message: { role: "system", content: "", toolsAdded: [{ name: "two", description: "", parameters: {} }], timestamp: clock++ },
+		};
+		const branch = entries(sys("s"), user("u1"), assistant("a1"), change, user("u2"), assistant("a2"), user("u3"));
+		expect(build(branch, "u3")).toEqual({ ok: false, reason: "tools changed during the session" });
+	});
+
+	it("refuses when a system prompt update reaches the wire next to the kept turns", () => {
+		const update = {
+			type: "message", id: "su",
+			message: { role: "system", content: "", sections: { b: "More." }, timestamp: clock++ },
+		};
+		const late = entries(sys("s"), user("u1"), assistant("a1"), user("u2"), update, assistant("a2"));
+		expect(build(late, "u2")).toEqual({ ok: false, reason: "the system prompt changed in the kept turns" });
+		const early = entries(sys("s"), user("u1"), update, assistant("a1"), user("u2"), assistant("a2"));
+		expect(build(early, "u2")).toMatchObject({ ok: true });
+	});
+
+	it("refuses when the last request does not hold the summarized messages", () => {
+		const branch = entries(sys("s"), user("u1"), assistant("a1"), user("u2"), assistant("a2"), user("u3"));
+		const stale = agentRequest(branch).slice(0, 2);
+		expect(build(branch, "u3", stale)).toEqual({ ok: false, reason: "the last request does not hold the summarized messages" });
+		expect(build(branch, "missing")).toEqual({ ok: false, reason: "first kept entry not found" });
+	});
+
+	it("refuses messages the session does not have at the cut", () => {
+		const branch = entries(sys("s"), user("u1"), assistant("a1"), user("u2"), assistant("a2"));
+		const request = agentRequest(branch);
+		request.splice(3, 0, { role: "assistant", content: [], timestamp: 1 } as never);
+		expect(build(branch, "u2", request)).toEqual({ ok: false, reason: "unexpected messages at the cut" });
 	});
 });
 
@@ -603,6 +760,11 @@ describe("session_before_compact handler", () => {
 	}
 	function ctx(r: FakeRun, apiKey = "sk-ant-oat01-x", model: unknown = MODEL) {
 		const notices: string[] = [];
+		recordAgentRequest("sess", {
+			modelId: "claude-haiku-5-5",
+			messages: agentRequest(branch),
+			declarationsKey: payloadDeclarationsKey({}),
+		});
 		return {
 			notices,
 			model,
@@ -637,6 +799,15 @@ describe("session_before_compact handler", () => {
 		expect(JSON.stringify(r.payloads[0].compaction)).toContain("r.ts");
 		expect(JSON.stringify(r.payloads[1].compaction)).not.toContain("r.ts");
 		expect(c.notices[0]).toContain("Using Pi's summary instead");
+	});
+
+	it("falls back without a request when there is no earlier agent request to continue", async () => {
+		const r: FakeRun = { events: compactionEvents(), payloads: [], options: [] };
+		const c = ctx(r);
+		forgetAgentRequests();
+		expect(await handlers().session_before_compact[0](event(), c)).toBeUndefined();
+		expect(r.payloads).toHaveLength(0);
+		expect(c.notices[0]).toContain("no earlier request to claude-haiku-5-5");
 	});
 
 	it("leaves compaction to Pi for API keys, other models, and the kill switch", async () => {

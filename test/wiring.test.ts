@@ -97,14 +97,20 @@ describe("extension wiring (Pi owns the OAuth lifecycle)", () => {
 		expect(overlay.config.oauth).toBeUndefined();
 	});
 
-	it("registers session_start hooks and no before_provider_request hook", async () => {
-		// Billing injection now lives in the overlay's onPayload, so the
-		// before_provider_request hook is intentionally gone.
+	it("registers session_start hooks and no payload-changing before_provider_request hook", async () => {
+		// Billing injection lives in the overlay's onPayload. The only
+		// before_provider_request hook marks agent payloads for server
+		// compaction and must leave them unchanged.
 		const spy = makeSpyPi();
 		await loadExtension(spy as unknown as ExtensionAPI);
 
 		expect(spy.handlers.session_start?.length).toBeGreaterThan(0);
-		expect(spy.handlers.before_provider_request).toBeUndefined();
+		for (const handler of spy.handlers.before_provider_request ?? []) {
+			const payload = { model: "claude-haiku-5-5", messages: [], system: [] };
+			const before = structuredClone(payload);
+			expect(await (handler as (event: unknown, ctx: unknown) => unknown)({ type: "before_provider_request", payload }, {})).toBeUndefined();
+			expect(payload).toEqual(before);
+		}
 		// pi >= 0.84.2: the internal rewind command powers automatic transcript
 		// refresh after "Edit and retry".
 		expect(spy.commands["claude-refusal-rewind"]).toMatchObject({

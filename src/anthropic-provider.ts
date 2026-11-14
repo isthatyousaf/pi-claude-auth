@@ -15,6 +15,9 @@ import { buildUserAgent } from "./signing.ts";
 import {
 	applyServerCompactionPayload,
 	contextCarriesCompactionBlock,
+	isAgentPayload,
+	payloadDeclarationsKey,
+	recordAgentRequest,
 	stripAnchors,
 } from "./server-compaction.ts";
 import { injectBillingHeader } from "./transforms.ts";
@@ -57,6 +60,8 @@ function oneHourCacheEnabled(): boolean {
  * - Turns off Anthropic message threads for requests that carry a compaction
  *   block: the API rejects threads on them, and pi-ai would otherwise spend a
  *   rejected request finding that out.
+ * - Records each agent request, which a server compaction request continues
+ *   ({@link recordAgentRequest}).
  *
  * Only applied to OAuth tokens (`sk-ant-oat`); plain API-key requests pass
  * through the built-in provider untouched and bill normally on their own.
@@ -81,6 +86,14 @@ function mergeClaudeCodeOptions<T extends StreamOptions>(
 		onPayload: async (payload, model) => {
 			const prior = await originalOnPayload?.(payload, model);
 			const current = prior ?? payload;
+			if (isAgentPayload(payload) || isAgentPayload(current)) {
+				recordAgentRequest(options.sessionId, {
+					modelId: model.id,
+					messages: [...context.messages],
+					declarationsKey: payloadDeclarationsKey(current),
+					cacheRetention: options.cacheRetention,
+				});
+			}
 			try {
 				const systemTextPlacement = applyServerCompactionPayload(current);
 				const updated = injectBillingHeader(current, {

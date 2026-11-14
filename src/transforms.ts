@@ -192,7 +192,10 @@ export function injectBillingHeader(
 					{ type: "text", text: content },
 				];
 			} else if (Array.isArray(content)) {
-				content.unshift(prefixBlock);
+				// After a cut inside a turn the first user message can hold tool
+				// results, which the API requires to lead the message.
+				const firstOther = content.findIndex((block) => block.type !== "tool_result");
+				content.splice(firstOther < 0 ? content.length : firstOther, 0, prefixBlock);
 			}
 		}
 	}
