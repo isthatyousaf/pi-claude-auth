@@ -17,6 +17,7 @@ import {
 	ANCHOR_TEXT,
 	forgetAgentRequests,
 	forgetCompactionBlocks,
+	lastAgentRequest,
 	rememberCompactionBlock,
 	summaryMessageText,
 } from "../src/server-compaction.ts";
@@ -166,6 +167,7 @@ describe("server compaction through the provider", () => {
 		rmSync(dir, { recursive: true, force: true });
 		delete process.env.PI_CODING_AGENT_DIR;
 		delete process.env.ANTHROPIC_CLI_VERSION;
+		delete process.env.PI_CLAUDE_AUTH_SERVER_COMPACTION;
 		forgetCompactionBlocks();
 		forgetAgentRequests();
 	});
@@ -190,13 +192,13 @@ describe("server compaction through the provider", () => {
 	}
 
 	/** Send an agent request the way Pi does, including its before_provider_request handlers. */
-	async function agentRequest(messages: Message[]): Promise<Body> {
+	async function agentRequest(messages: Message[], reasoning = "high"): Promise<Body> {
 		const before = bodies.length;
 		const stream = runtime.streamSimple(model, { messages }, {
 			apiKey: OAUTH_TOKEN,
 			sessionId: SESSION,
 			maxRetries: 0,
-			reasoning: "high",
+			reasoning,
 			onPayload: async (payload: unknown) => {
 				let current = payload;
 				for (const handler of handlers.before_provider_request ?? []) {
@@ -315,7 +317,7 @@ describe("server compaction through the provider", () => {
 			assistant("a2", "medium"),
 		);
 		// The last agent request is the one that produced a2.
-		await agentRequest((await sessionRequest(branch)).slice(0, -1));
+		await agentRequest((await sessionRequest(branch)).slice(0, -1), "medium");
 		const result = await compact(branch, "t");
 		expect(result?.compaction.firstKeptEntryId).toBe("t");
 		const [body] = compactionBodies();
@@ -349,7 +351,7 @@ describe("server compaction through the provider", () => {
 			assistant("a2", "medium"),
 		);
 		// The last agent request is the one that produced a2.
-		await agentRequest((await sessionRequest(branch)).slice(0, -1));
+		await agentRequest((await sessionRequest(branch)).slice(0, -1), "medium");
 		const result = await compact(branch, "a2");
 		if (!result) throw new Error("expected a server compaction");
 		const [body] = compactionBodies();
@@ -365,6 +367,73 @@ describe("server compaction through the provider", () => {
 		expect(later.messages[0]).toMatchObject({ role: "assistant", content: [{ type: "compaction", content: "Summary 1" }] });
 		expect(texts.findIndex((t: string) => t.includes(SYSTEM_TEXT))).toBe(texts.findIndex((t: string) => t.includes("prompt u3")) - 1);
 		expect(texts.findIndex((t: string) => t.includes("reply a2"))).toBeLessThan(texts.findIndex((t: string) => t.includes(SYSTEM_TEXT)));
+	});
+
+	it("falls back when a reply aborted with Esc sits at the cut [round 2, finding 1]", async () => {
+		const aborted = assistant("ab", "high", [{ type: "text", text: "partial" }]);
+		(aborted.message as { stopReason: string }).stopReason = "aborted";
+		const branch = chain(sys("s"), user("u1"), assistant("a1"), user("u2"), aborted, user("u3"), assistant("a3"), user("u4"));
+		const agentBody = await agentRequest(await sessionRequest(branch));
+		// pi-ai skips the aborted reply, so u2 and u3 meet on the wire.
+		expect(JSON.stringify(agentBody.messages)).not.toContain("partial");
+		expect(await compact(branch, "u3")).toBeUndefined();
+		expect(await compact(branch, "ab")).toBeUndefined();
+		expect(compactionBodies()).toHaveLength(0);
+	});
+
+	it("falls back when Pi's handlers rewrote a message of the agent request [round 2, finding 2]", async () => {
+		const branch = chain(sys("s"), user("u1"), assistant("a1"), user("u2"), assistant("a2"), user("u3"));
+		handlers.before_provider_request.push((event) => {
+			const payload = (event as { payload: Body }).payload;
+			return {
+				...payload,
+				messages: payload.messages.map((m: Body) =>
+					JSON.stringify(m.content).includes("prompt u1") ? { ...m, content: [{ type: "text", text: "payload rewrite of u1" }] } : m,
+				),
+			};
+		});
+		const agentBody = await agentRequest(await sessionRequest(branch));
+		expect(JSON.stringify(agentBody.messages)).toContain("payload rewrite of u1");
+		expect(await compact(branch, "u2")).toBeUndefined();
+		expect(compactionBodies()).toHaveLength(0);
+	});
+
+	it("forgets the recorded request when the branch or session changes [round 2, findings 3 and 5]", async () => {
+		const branch = chain(sys("s"), user("u1"), assistant("a1"), user("u2"), assistant("a2"), user("u3"));
+		for (const event of ["session_tree", "session_compact", "session_start", "session_shutdown"]) {
+			await agentRequest(await sessionRequest(branch));
+			expect(lastAgentRequest(SESSION)).toBeDefined();
+			for (const handler of handlers[event] ?? []) await handler({ type: event, compactionEntry: branch[0] }, ctx(branch));
+			expect(lastAgentRequest(SESSION)).toBeUndefined();
+		}
+		expect(await compact(branch, "u2")).toBeUndefined();
+		expect(compactionBodies()).toHaveLength(0);
+	});
+
+	it("records agent requests only when server compaction can apply [round 2, finding 5]", async () => {
+		const messages = await sessionRequest(chain(sys("s"), user("u1")));
+		process.env.PI_CLAUDE_AUTH_SERVER_COMPACTION = "0";
+		await agentRequest(messages);
+		expect(lastAgentRequest(SESSION)).toBeUndefined();
+		delete process.env.PI_CLAUDE_AUTH_SERVER_COMPACTION;
+
+		const older = runtime.getModels("anthropic").find((m) => m.id === "claude-haiku-4-5");
+		if (!older) throw new Error("claude-haiku-4-5 missing from the catalog");
+		const stream = runtime.streamSimple(older, { messages }, {
+			apiKey: OAUTH_TOKEN,
+			sessionId: SESSION,
+			maxRetries: 0,
+			onPayload: async (payload: unknown) => {
+				for (const handler of handlers.before_provider_request ?? []) await handler({ type: "before_provider_request", payload }, {});
+				return undefined;
+			},
+		} as never);
+		await stream.result();
+		expect(lastAgentRequest(SESSION)).toBeUndefined();
+
+		await agentRequest(messages);
+		expect(lastAgentRequest(SESSION)?.modelId).toBe("claude-haiku-5-5");
+		expect(lastAgentRequest("another-session")).toBeUndefined();
 	});
 
 	it("keeps the active anchor on the kept side when a repeated compaction cuts right after it [finding 6]", async () => {

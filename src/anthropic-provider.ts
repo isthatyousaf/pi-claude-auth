@@ -18,7 +18,9 @@ import {
 	isAgentPayload,
 	payloadDeclarationsKey,
 	recordAgentRequest,
+	recordsAgentRequests,
 	stripAnchors,
+	wireMessageRecords,
 } from "./server-compaction.ts";
 import { injectBillingHeader } from "./transforms.ts";
 
@@ -86,10 +88,14 @@ function mergeClaudeCodeOptions<T extends StreamOptions>(
 		onPayload: async (payload, model) => {
 			const prior = await originalOnPayload?.(payload, model);
 			const current = prior ?? payload;
-			if (isAgentPayload(payload) || isAgentPayload(current)) {
+			if (
+				recordsAgentRequests(model.id) &&
+				(isAgentPayload(payload) || isAgentPayload(current))
+			) {
 				recordAgentRequest(options.sessionId, {
 					modelId: model.id,
 					messages: [...context.messages],
+					wire: wireMessageRecords(current),
 					declarationsKey: payloadDeclarationsKey(current),
 					cacheRetention: options.cacheRetention,
 				});

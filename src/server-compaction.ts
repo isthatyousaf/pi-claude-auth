@@ -331,10 +331,19 @@ function moveAnchorPastToolResults(messages: WireMessage[], index: number): void
 // Last agent request
 // ---------------------------------------------------------------------------
 
+/** A wire message of a recorded request, compared without cache breakpoints. */
+export interface WireMessageRecord {
+	role: string;
+	key: string;
+}
+
 /** What the last agent request of a session sent, before this extension's payload transforms. */
 export interface AgentRequestRecord {
 	modelId: string;
+	/** The provider context, used to choose the cut. */
 	messages: readonly Message[];
+	/** The payload messages after Pi's handlers, which the compaction request must repeat. */
+	wire: readonly WireMessageRecord[];
 	/** `tools` and `system` of the payload, compared by {@link payloadDeclarationsKey}. */
 	declarationsKey: string;
 	cacheRetention?: unknown;
@@ -343,7 +352,9 @@ export interface AgentRequestRecord {
 // Pi emits before_provider_request only for agent requests. Its handler marks
 // the payload, and the overlay records the request when it sees that payload.
 const agentPayloads = new WeakSet<object>();
-const agentRequests = new Map<string, AgentRequestRecord>();
+// Only the current session's last request is kept; anything that changes the
+// branch or the session forgets it.
+let agentRequest: { sessionId: string; record: AgentRequestRecord } | undefined;
 
 export function markAgentPayload(payload: unknown): void {
 	if (payload && typeof payload === "object") agentPayloads.add(payload);
@@ -353,6 +364,10 @@ export function isAgentPayload(payload: unknown): boolean {
 	return !!payload && typeof payload === "object" && agentPayloads.has(payload);
 }
 
+function withoutCacheControl(_key: string, value: unknown): unknown {
+	return _key === "cache_control" ? undefined : value;
+}
+
 /**
  * Declarations a compaction request must share with the agent requests around
  * it. Cache breakpoints are left out: they do not change the prompt, and the
@@ -360,24 +375,62 @@ export function isAgentPayload(payload: unknown): boolean {
  */
 export function payloadDeclarationsKey(payload: unknown): string {
 	const p = (payload ?? {}) as WirePayload;
-	return JSON.stringify({ tools: p.tools ?? null, system: p.system ?? null }, (key, value) =>
-		key === "cache_control" ? undefined : value,
-	);
+	return JSON.stringify({ tools: p.tools ?? null, system: p.system ?? null }, withoutCacheControl);
+}
+
+export function wireMessageRecords(payload: unknown): WireMessageRecord[] {
+	const messages = (payload as WirePayload | undefined)?.messages;
+	if (!Array.isArray(messages)) return [];
+	return messages.map((message: WireMessage) => ({
+		role: String(message?.role),
+		key: JSON.stringify(message, withoutCacheControl),
+	}));
+}
+
+/** Whether the overlay records agent requests to this model at all. */
+export function recordsAgentRequests(modelId: string): boolean {
+	return serverCompactionEnabled() && supportsServerCompaction(modelId);
 }
 
 export function recordAgentRequest(
 	sessionId: string | undefined,
 	record: AgentRequestRecord,
 ): void {
-	if (sessionId) agentRequests.set(sessionId, record);
+	agentRequest = sessionId ? { sessionId, record } : undefined;
 }
 
 export function lastAgentRequest(sessionId: string): AgentRequestRecord | undefined {
-	return agentRequests.get(sessionId);
+	return agentRequest?.sessionId === sessionId ? agentRequest.record : undefined;
 }
 
 export function forgetAgentRequests(): void {
-	agentRequests.clear();
+	agentRequest = undefined;
+}
+
+/**
+ * Why the compaction request's wire messages do not continue the recorded
+ * request, or undefined when they do. They must repeat its first messages
+ * exactly, and the next recorded message (or the response to the recorded
+ * request, when they repeat all of it) must start a new turn: an assistant
+ * message after an effort marker, otherwise a non-system message of the other
+ * role.
+ */
+export function wirePrefixMismatch(
+	sent: readonly unknown[],
+	recorded: readonly WireMessageRecord[],
+): string | undefined {
+	if (sent.length > recorded.length) return "the compaction request outgrows the last request";
+	for (let i = 0; i < sent.length; i++) {
+		if (JSON.stringify(sent[i], withoutCacheControl) !== recorded[i].key)
+			return "the compaction request differs from the last request";
+	}
+	const last = sent.at(-1) as WireMessage | undefined;
+	const nextRole = sent.length < recorded.length ? recorded[sent.length].role : "assistant";
+	if (isEffortMarker(last)) {
+		return nextRole === "assistant" ? undefined : "the effort marker does not precede a kept reply";
+	}
+	if (nextRole === "system" || nextRole === last?.role) return "the cut splits a turn on the wire";
+	return undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -403,11 +456,14 @@ export function findAnchorIndex(
 	projection: SessionProjection,
 ): number | undefined {
 	const pathIndex = new Map(branch.map((entry, index) => [entry.id, index]));
+	// Entries omitted by context edits so far. A decision uses the edits that
+	// precede its compaction: those are the ones the requests before it applied.
+	const omitted = new Set<string>();
 	const visibleMessages = (entry: SessionEntry) =>
-		entry.type === "compaction"
+		entry.type === "compaction" || omitted.has(entry.id)
 			? []
 			: (convertToLlm(sessionEntryToContextMessages(entry) as never) as Message[]).filter(
-					(message) => message.role !== "system",
+					(message) => message.role !== "system" && isSent(message),
 				);
 	const messagesBetween = (from: number, to: number) =>
 		branch.slice(from + 1, to).some((entry) => visibleMessages(entry).length > 0);
@@ -422,6 +478,11 @@ export function findAnchorIndex(
 	let active: SessionEntry | undefined;
 	let newestFirstKept = 0;
 	for (const entry of branch) {
+		if (entry.type === "context_edit") {
+			if (entry.replacement === null) omitted.add(entry.targetId);
+			else omitted.delete(entry.targetId);
+			continue;
+		}
 		if (entry.type !== "compaction") continue;
 		const firstKept = pathIndex.get(entry.firstKeptEntryId);
 		const previousFirstKept = newestFirstKept;
@@ -604,6 +665,20 @@ function isAnthropicEffort(value: unknown): value is string {
 	);
 }
 
+/** Whether pi-ai sends a context message at all; it skips failed replies and empty prompts. */
+function isSent(message: Message): boolean {
+	if (message.role === "assistant") {
+		const stop = (message as { stopReason?: string }).stopReason;
+		return stop !== "error" && stop !== "aborted" && message.content.length > 0;
+	}
+	if (message.role === "user") {
+		return typeof message.content === "string"
+			? message.content.trim().length > 0
+			: message.content.length > 0;
+	}
+	return true;
+}
+
 function isAnchorMessage(message: { role?: string; content?: unknown }): boolean {
 	return (
 		message.role === "user" && Array.isArray(message.content) && message.content.some(isAnchorBlock)
@@ -703,7 +778,7 @@ export function buildCompactionRequestMessages(options: {
 	if (cut <= 0) return fail("first kept entry not found");
 	const visible = (entries: typeof projection.entries) =>
 		(convertToLlm(entries.flatMap((entry) => entry.messages) as never) as Message[]).filter(
-			(message) => message.role !== "system",
+			(message) => message.role !== "system" && isSent(message),
 		);
 	const lastSummarized = visible(projection.entries.slice(0, cut)).at(-1);
 	const firstKept = visible(projection.entries.slice(cut))[0];
@@ -798,6 +873,8 @@ export async function requestServerCompaction(options: {
 	instructions: string;
 	/** {@link payloadDeclarationsKey} of the last agent request; a mismatch aborts the request. */
 	declarationsKey?: string;
+	/** Wire messages of the last agent request; see {@link wirePrefixMismatch}. */
+	recordedWire?: readonly WireMessageRecord[];
 	cacheRetention?: unknown;
 	signal?: AbortSignal;
 }): Promise<CompactionOutcome> {
@@ -833,6 +910,10 @@ export async function requestServerCompaction(options: {
 					if (options.keptAssistantEffort)
 						marker.output_config = { ...marker.output_config, effort: options.keptAssistantEffort };
 					else messages.pop();
+				}
+				if (options.recordedWire) {
+					const mismatch = wirePrefixMismatch(Array.isArray(messages) ? messages : [], options.recordedWire);
+					if (mismatch) throw new Error(mismatch);
 				}
 				p.compaction = { type: "summarize", instructions: options.instructions };
 				addBeta(p, COMPACT_BETA);
@@ -930,6 +1011,7 @@ async function compactOnServer(event: SessionBeforeCompactEvent, ctx: ExtensionC
 				keptAssistantEffort: request.keptAssistantEffort,
 				instructions,
 				declarationsKey: last.declarationsKey,
+				recordedWire: last.wire,
 				cacheRetention: last.cacheRetention,
 				signal: event.signal,
 			});
@@ -1002,13 +1084,21 @@ async function anchorAgentRequest<T extends TimedMessage>(
 }
 
 export function registerServerCompaction(pi: ExtensionAPI): void {
+	// A recorded request belongs to one session and one branch; it must not be
+	// continued after either changes.
 	pi.on("session_start", (_event, ctx) => {
+		forgetAgentRequests();
 		rememberCompactionBlocks(ctx.sessionManager.getEntries());
 	});
+	pi.on("session_shutdown", () => {
+		forgetAgentRequests();
+	});
 	pi.on("session_tree", (_event, ctx) => {
+		forgetAgentRequests();
 		rememberCompactionBlocks(ctx.sessionManager.getBranch());
 	});
 	pi.on("session_compact", (event) => {
+		forgetAgentRequests();
 		rememberCompactionBlocks([event.compactionEntry]);
 	});
 	pi.on("before_provider_request", (event) => {

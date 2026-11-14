@@ -26,6 +26,8 @@ import {
 	requestServerCompaction,
 	stripAnchors,
 	summaryMessageText,
+	wireMessageRecords,
+	wirePrefixMismatch,
 } from "../src/server-compaction.ts";
 import { injectBillingHeader } from "../src/transforms.ts";
 
@@ -400,6 +402,29 @@ describe("findAnchorIndex", () => {
 		expect(ids(projection, index)).toEqual(["u3"]);
 	});
 
+	it("judges anchor history by what was visible when each compaction ran", () => {
+		const omit = (id: string, targetId: string) => ({ type: "context_edit", id, targetId, replacement: null });
+		// x was omitted before c2: the requests before c2 sent a2, anchor, u3.
+		const before = entries(
+			sys("s"), user("u1"), assistant("a1"), user("u2"), assistant("a2"),
+			serverCompaction("c1", "u2", "first"), user("x"), user("u3"), assistant("a3"), omit("e", "x"),
+			serverCompaction("c2", "u3", "second"), user("u4"),
+		);
+		let projection = buildSessionProjection(before);
+		let index = findAnchorIndex(before, projection) as number;
+		expect(projection.entries.slice(index).flatMap((entry) => entry.messages).map((m) => JSON.stringify((m as { content?: unknown }).content))[0]).toContain("u3");
+
+		// x was omitted after c2: c2 summarized c1's anchor, so the anchor stays after c2's kept turns.
+		const after = entries(
+			sys("s"), user("u1"), assistant("a1"), user("u2"), assistant("a2"),
+			serverCompaction("c1", "u2", "first"), user("x"), user("u3"), assistant("a3"),
+			serverCompaction("c2", "u3", "second"), omit("e", "x"), user("u4"),
+		);
+		projection = buildSessionProjection(after);
+		index = findAnchorIndex(after, projection) as number;
+		expect(ids(projection, index)).toEqual(["e", "u4"]);
+	});
+
 	it("does not revive an anchor that was never used", () => {
 		// c2 kept c1's anchor, so c2 placed none. c3 summarizes c1's anchor and
 		// must place its own after its kept turns, not one right after c2.
@@ -558,6 +583,14 @@ describe("buildCompactionRequestMessages", () => {
 		expect(texts(request.messages).at(-1)).toContain("u3");
 	});
 
+	it("ignores replies pi-ai never sends at the boundary", () => {
+		const aborted = assistant("ab");
+		(aborted.message as { stopReason: string }).stopReason = "aborted";
+		const branch = entries(sys("s"), user("u1"), assistant("a1"), user("u2"), aborted, user("u3"), assistant("a3"));
+		expect(build(branch, "u3")).toMatchObject({ ok: false });
+		expect(build(branch, "ab")).toMatchObject({ ok: false });
+	});
+
 	it("refuses a cut between two messages of the same wire role", () => {
 		const custom = {
 			type: "custom_message", id: "c", customType: "note", content: "injected", display: false,
@@ -598,6 +631,46 @@ describe("buildCompactionRequestMessages", () => {
 		const request = agentRequest(branch);
 		request.splice(3, 0, { role: "assistant", content: [], timestamp: 1 } as never);
 		expect(build(branch, "u2", request)).toEqual({ ok: false, reason: "unexpected messages at the cut" });
+	});
+});
+
+describe("wirePrefixMismatch", () => {
+	const u = (text: string) => ({ role: "user", content: [{ type: "text", text }] });
+	const a = (text: string) => ({ role: "assistant", content: [{ type: "text", text }] });
+	const recorded = wireMessageRecords({
+		messages: [u("u1"), marker("high"), a("a1"), u("u2"), u("u3"), marker("medium"), a("a3"), u("u4"), marker("high")],
+	});
+
+	it("accepts an exact prefix that ends before a new turn", () => {
+		expect(wirePrefixMismatch([u("u1"), marker("high"), a("a1")], recorded)).toBeUndefined();
+		expect(wirePrefixMismatch([u("u1"), marker("high"), a("a1"), u("u2"), u("u3"), marker("medium")], recorded)).toBeUndefined();
+		// The whole request, ending with the effort of its response.
+		expect(wirePrefixMismatch(recorded.map((r) => JSON.parse(r.key)), recorded)).toBeUndefined();
+	});
+
+	it("ignores cache breakpoints", () => {
+		const cached = { role: "user", content: [{ type: "text", text: "u1", cache_control: { type: "ephemeral" } }] };
+		expect(wirePrefixMismatch([cached, marker("high"), a("a1")], recorded)).toBeUndefined();
+	});
+
+	it("rejects a cut inside a wire turn", () => {
+		expect(wirePrefixMismatch([u("u1"), marker("high"), a("a1"), u("u2")], recorded)).toBe("the cut splits a turn on the wire");
+	});
+
+	it("rejects an effort marker the last request did not send there", () => {
+		expect(wirePrefixMismatch([u("u1"), marker("high"), a("a1"), u("u2"), marker("high")], recorded)).toBe(
+			"the compaction request differs from the last request",
+		);
+		expect(wirePrefixMismatch([u("u1"), marker("high")], wireMessageRecords({ messages: [u("u1"), marker("high"), u("u2")] }))).toBe(
+			"the effort marker does not precede a kept reply",
+		);
+	});
+
+	it("rejects messages the last request did not send", () => {
+		expect(wirePrefixMismatch([u("rewritten"), marker("high"), a("a1")], recorded)).toBe("the compaction request differs from the last request");
+		expect(wirePrefixMismatch([...recorded.map((r) => JSON.parse(r.key)), a("extra")], recorded)).toBe(
+			"the compaction request outgrows the last request",
+		);
 	});
 });
 
