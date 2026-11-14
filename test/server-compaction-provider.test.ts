@@ -436,6 +436,55 @@ describe("server compaction through the provider", () => {
 		expect(lastAgentRequest("another-session")).toBeUndefined();
 	});
 
+	it("forgets the record when a request goes to another model or auth, or the model changes [round 3, finding 1]", async () => {
+		const branch = chain(sys("s", [tool("one")]), user("u1"), assistant("a1"), user("u2"), assistant("a2"), user("u3"));
+		const messages = await sessionRequest(branch);
+		const older = runtime.getModels("anthropic").find((m) => m.id === "claude-haiku-4-5");
+		if (!older) throw new Error("claude-haiku-4-5 missing from the catalog");
+		const send = async (target: Model<Api>, apiKey: string) => {
+			const stream = runtime.streamSimple(target, { messages }, {
+				apiKey,
+				sessionId: SESSION,
+				maxRetries: 0,
+				onPayload: async (payload: unknown) => {
+					for (const handler of handlers.before_provider_request ?? []) await handler({ type: "before_provider_request", payload }, {});
+					return undefined;
+				},
+			} as never);
+			await stream.result();
+		};
+
+		await agentRequest(messages);
+		await send(older, OAUTH_TOKEN);
+		expect(lastAgentRequest(SESSION)).toBeUndefined();
+		// Back on the supported model, compaction must not reuse the request recorded before the switch.
+		expect(await compact(branch, "u2")).toBeUndefined();
+		expect(compactionBodies()).toHaveLength(0);
+
+		await agentRequest(messages);
+		await send(model, "sk-ant-api03-test-key");
+		expect(lastAgentRequest(SESSION)).toBeUndefined();
+
+		await agentRequest(messages);
+		for (const handler of handlers.model_select ?? []) await handler({ type: "model_select", model: older }, ctx(branch));
+		expect(lastAgentRequest(SESSION)).toBeUndefined();
+	});
+
+	it("falls back when a context edit changed a summarized message after the last request [round 3, finding 2]", async () => {
+		const branch = chain(sys("s"), user("u1"), assistant("a1"), user("u2"), assistant("a2"), user("u3"));
+		const editAfter = (replacement: unknown) => {
+			const [edit] = chain({ type: "context_edit", id: "edit", targetId: "u1", replacement });
+			(edit as { parentId: string }).parentId = "u3";
+			return [...branch, edit];
+		};
+		await agentRequest(await sessionRequest(branch));
+		expect(await compact(editAfter(null), "u2")).toBeUndefined();
+		expect(await compact(editAfter({ content: [{ type: "text", text: "edited u1" }] }), "u2")).toBeUndefined();
+		expect(compactionBodies()).toHaveLength(0);
+		// Without the edit the same record is accepted.
+		expect(await compact(branch, "u2")).toBeDefined();
+	});
+
 	it("keeps the active anchor on the kept side when a repeated compaction cuts right after it [finding 6]", async () => {
 		rememberCompactionBlock("First", { type: "compaction", content: "First", signature: "sig-first" });
 		let branch = chain(sys("s"), user("u1"), assistant("a1"), user("u2"), assistant("a2"));

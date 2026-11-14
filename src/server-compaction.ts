@@ -801,6 +801,22 @@ export function buildCompactionRequestMessages(options: {
 	const nextRole = anchorKept ? "user" : firstKept ? wireRole(firstKept, model) : undefined;
 	if (nextRole === lastRole) return fail("the cut splits a turn");
 
+	// The summarized messages Pi would send now must be the ones the last
+	// request sent; a context edit since then changes them.
+	const comparable = (message: Message) =>
+		JSON.stringify([message.role, message.timestamp, message.content]);
+	const summarizedNow = (
+		convertToLlm(projection.entries.slice(0, cut).flatMap((entry) => entry.messages) as never) as Message[]
+	).filter((message) => message.role !== "system");
+	const summarizedSent = request
+		.slice(0, cutIndex)
+		.filter((message) => message.role !== "system" && !isAnchorMessage(message));
+	if (
+		summarizedNow.length !== summarizedSent.length ||
+		summarizedNow.some((message, i) => comparable(message) !== comparable(summarizedSent[i]))
+	)
+		return fail("the session changed since the last request");
+
 	for (let i = 1; i < request.length; i++) {
 		const message = request[i];
 		if (changesTools(message)) return fail("tools changed during the session");
@@ -1101,8 +1117,15 @@ export function registerServerCompaction(pi: ExtensionAPI): void {
 		forgetAgentRequests();
 		rememberCompactionBlocks([event.compactionEntry]);
 	});
+	// Every agent request first forgets the record; the overlay records it
+	// again only for an OAuth request to a supported model, so a request to any
+	// other model, provider or auth leaves no stale record behind.
 	pi.on("before_provider_request", (event) => {
+		forgetAgentRequests();
 		markAgentPayload(event.payload);
+	});
+	pi.on("model_select", () => {
+		forgetAgentRequests();
 	});
 	pi.on("session_before_compact", async (event, ctx) => {
 		try {
