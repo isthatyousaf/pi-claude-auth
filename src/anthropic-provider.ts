@@ -12,6 +12,11 @@ import { createClaudeCodeFetch, isAnthropicOAuthToken } from "./cch.ts";
 import type { DeviceIdentity } from "./device-id.ts";
 import { log } from "./logger.ts";
 import { buildUserAgent } from "./signing.ts";
+import {
+	applyServerCompactionPayload,
+	contextCarriesCompactionBlock,
+	stripAnchors,
+} from "./server-compaction.ts";
 import { injectBillingHeader } from "./transforms.ts";
 
 /**
@@ -44,10 +49,14 @@ function oneHourCacheEnabled(): boolean {
  * - Merges {@link claudeCodeHeaders} into `options.headers`.
  * - Wraps the transport with {@link createClaudeCodeFetch} so the `cch`
  *   placeholder is resolved against the final serialized body.
- * - Chains `onPayload`: runs any pre-existing transform first, then applies
- *   {@link injectBillingHeader} (billing block + system relocation + device
- *   metadata) to the result, so other extensions' payload transforms compose
- *   correctly.
+ * - Chains `onPayload`: runs any pre-existing transform first, then swaps in
+ *   a server-compaction block ({@link applyServerCompactionPayload}), then
+ *   applies {@link injectBillingHeader} (billing block + system relocation +
+ *   device metadata) to the result, so other extensions' payload transforms
+ *   compose correctly.
+ * - Turns off Anthropic message threads for requests that carry a compaction
+ *   block: the API rejects threads on them, and pi-ai would otherwise spend a
+ *   rejected request finding that out.
  *
  * Only applied to OAuth tokens (`sk-ant-oat`); plain API-key requests pass
  * through the built-in provider untouched and bill normally on their own.
@@ -55,6 +64,7 @@ function oneHourCacheEnabled(): boolean {
 function mergeClaudeCodeOptions<T extends StreamOptions>(
 	options: T,
 	device: DeviceIdentity | null,
+	context: Context,
 ): T {
 	const originalOnPayload = options.onPayload;
 	const transport = options.fetch ?? globalThis.fetch;
@@ -63,14 +73,20 @@ function mergeClaudeCodeOptions<T extends StreamOptions>(
 		// Claude Code uses ENABLE_PROMPT_CACHING_1H to force ttl="1h". Pi's
 		// Anthropic provider maps cacheRetention="long" to the same wire shape.
 		...(oneHourCacheEnabled() ? { cacheRetention: "long" } : {}),
+		...(contextCarriesCompactionBlock(context.messages)
+			? { disableContinuation: true }
+			: {}),
 		headers: { ...options.headers, ...claudeCodeHeaders(options.sessionId) },
 		fetch: createClaudeCodeFetch(transport),
 		onPayload: async (payload, model) => {
 			const prior = await originalOnPayload?.(payload, model);
+			const current = prior ?? payload;
 			try {
-				const updated = injectBillingHeader(prior ?? payload, {
+				const systemTextPlacement = applyServerCompactionPayload(current);
+				const updated = injectBillingHeader(current, {
 					sessionId: options.sessionId,
 					device,
+					systemTextPlacement,
 				});
 				if (updated) {
 					log("billing_header_injected", {});
@@ -80,6 +96,8 @@ function mergeClaudeCodeOptions<T extends StreamOptions>(
 				log("billing_header_error", {
 					error: err instanceof Error ? err.message : String(err),
 				});
+			} finally {
+				stripAnchors(current);
 			}
 			return prior;
 		},
@@ -174,7 +192,7 @@ export function createAnthropicStreamOverlay(
 			return delegate(
 				model,
 				context,
-				mergeClaudeCodeOptions(options, device),
+				mergeClaudeCodeOptions(options, device, context),
 			);
 		},
 	};

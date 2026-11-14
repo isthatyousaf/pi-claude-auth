@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Compaction on supported Claude models (Claude 4.6 and newer) now asks Anthropic for the summary when you use your subscription login. Anthropic returns a signed summary that later requests send in place of Pi's text, so Claude keeps the thinking in the turns kept after compaction instead of dropping it (`thinking_dropped`). When Anthropic returns no summary, Pi writes its own as before. Set `PI_CLAUDE_AUTH_SERVER_COMPACTION=0` to turn this off. See [Compaction](README.md#compaction).
+
 ## [1.4.0] - 2026-10-30
 
 ### Breaking Changes

@@ -11,6 +11,7 @@ import {
 } from "./claude-version.ts";
 import { initLogger, log } from "./logger.ts";
 import { registerRetryAfterRefusal } from "./retry-refusal.ts";
+import { registerServerCompaction } from "./server-compaction.ts";
 import { normalizeTransportError } from "./transport-errors.ts";
 import { builtinProviders } from "@earendil-works/pi-ai/providers/all";
 import { createAnthropicStreamOverlay } from "./anthropic-provider.ts";
@@ -70,6 +71,9 @@ function showVersionAlert(
  *   (cc_prompt_id et al.), mirrors the prompt id into the
  *   x-claude-code-prompt-id transport header, and sends the machine's
  *   ~/.claude.json identity as metadata.user_id.
+ * - Has Anthropic write the compaction summary on models that support
+ *   on-demand compaction, so thinking in the turns kept after compaction stays
+ *   valid (see server-compaction.ts).
  * - Handles Anthropic Fable 5-family and Opus 5-family classifier refusals
  *   with an
  *   interactive branch-or-continue workflow.
@@ -126,6 +130,7 @@ export function createClaudeAuthExtension(
 
 		pi.on("message_end", normalizeTransportError);
 		registerRetryAfterRefusal(pi);
+		registerServerCompaction(pi);
 
 		// Surface a degraded-version alert on startup (offline resolutions stay
 		// silent). No credential work here: pi already loaded auth.json and prefers

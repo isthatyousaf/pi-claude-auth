@@ -77,6 +77,19 @@ Anything you typed while the refusal was landing still runs after the rewind. Pi
 
 The extension steps in once the refusal has fully arrived. A stream that hangs instead never gets that far, and you are back to aborting the turn yourself.
 
+## Compaction
+
+On Claude models that support on-demand compaction (Claude 4.6 and newer, for example Haiku 5.5, Sonnet 5.5, Opus 5.5 and Fable 5.2), the extension has Anthropic write the summary when Pi compacts a subscription (OAuth) session, with `/compact` or automatically.
+
+Pi's own summary is plain text that Anthropic did not write, so Anthropic discards the thinking in the turns Pi keeps after it. The session file shows this as `thinking_dropped` (`prefix_binding_mismatch`) in the `anthropic_input_transformations` diagnostics. Anthropic's summary comes as a signed `compaction` block. The extension saves the whole block in the compaction entry (`details.anthropicCompaction`) and sends it in place of Pi's summary on every later request, including after a resume, so the kept thinking stays valid.
+
+- The summary uses Pi's usual format and includes your `/compact` instructions. It shows in Pi as usual, and its cost appears in the compaction entry.
+- After a server summary, Pi's system prompt moves to a fixed point right after the kept turns instead of into your first message, because text added inside a kept turn would also discard its thinking.
+- Requests that carry a compaction block do not use Anthropic's message threads, which reject them.
+- If Anthropic does not return a block (an error, a refusal, or any other stop reason), you get a warning and Pi writes its own summary as before. A cancelled compaction stays cancelled.
+
+API-key logins, other models and other providers keep Pi's own compaction. Set `PI_CLAUDE_AUTH_SERVER_COMPACTION=0` to turn the feature off. Sessions compacted earlier then send Pi's text summary again.
+
 ## Transport failures
 
 The extension helps Pi's native retry mechanism recognize these Anthropic errors:
@@ -136,6 +149,7 @@ execute.
 | `ANTHROPIC_USER_AGENT` | Override the whole user-agent string. |
 | `PI_CLAUDE_AUTH_DEBUG` | Set `1` to write diagnostics to `~/.pi/agent/pi-claude-auth-debug.log`. The log redacts secrets. |
 | `PI_CLAUDE_AUTH_REFUSAL_MODE` | Refusal policy for the Fable 5 and Opus 5 families: `ask` (default) or `auto`. |
+| `PI_CLAUDE_AUTH_SERVER_COMPACTION` | Set `0`, `false`, `no`, or `off` to use Pi's own compaction summaries instead of Anthropic's. See [Compaction](#compaction). |
 | `ENABLE_PROMPT_CACHING_1H` | Set `1`, `true`, `yes`, or `on` to use Claude Code's one-hour prompt-cache TTL for subscription requests. This overrides short retention. Pi's equivalent process-wide setting is `PI_CACHE_RETENTION=long`. |
 
 ## Credits

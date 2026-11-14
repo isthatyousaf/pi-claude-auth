@@ -5,6 +5,7 @@ import {
 } from "./signing.ts";
 import type { DeviceIdentity } from "./device-id.ts";
 import { nextTurn } from "./turn.ts";
+import { isAnchorBlock, type SystemTextPlacement } from "./server-compaction.ts";
 
 const BILLING_PREFIX = "x-anthropic-billing-header";
 // Identity line pi's built-in provider emits for OAuth tokens (our trigger).
@@ -39,6 +40,12 @@ interface AnthropicPayload {
 export interface BillingContext {
 	sessionId?: string;
 	device: DeviceIdentity | null;
+	/**
+	 * Where the relocated system text goes: the first user message (default),
+	 * the server-compaction anchor block, or nowhere (a compaction request that
+	 * must not change its summarized messages).
+	 */
+	systemTextPlacement?: SystemTextPlacement;
 }
 
 function isClaudeModel(model: unknown): model is string {
@@ -52,6 +59,20 @@ function entryText(entry: unknown): string {
 		if (typeof text === "string") return text;
 	}
 	return "";
+}
+
+type ContentBlock = { type?: string; text?: string; cache_control?: unknown };
+
+function findAnchor(
+	messages: Array<{ content?: string | ContentBlock[] }>,
+): { content: ContentBlock[]; index: number; block: ContentBlock } | undefined {
+	for (const message of messages) {
+		if (!Array.isArray(message.content)) continue;
+		const index = message.content.findIndex(isAnchorBlock);
+		if (index >= 0)
+			return { content: message.content, index, block: message.content[index] };
+	}
+	return undefined;
 }
 
 /**
@@ -99,7 +120,7 @@ export function injectBillingHeader(
 
 	const messages = p.messages as Array<{
 		role?: string;
-		content?: string | Array<{ type?: string; text?: string }>;
+		content?: string | ContentBlock[];
 	}>;
 	const turn = nextTurn(ctx.sessionId ?? "session", messages);
 	const billingHeader = buildBillingHeaderValue(
@@ -136,20 +157,34 @@ export function injectBillingHeader(
 		},
 	];
 
-	if (movedEntries.length > 0) {
-		const firstUser = messages.find((m) => m.role === "user");
-		if (firstUser) {
-			const prefix = movedEntries.map((entry) => entry.text).join("\n\n");
-			const prefixCacheControl = movedEntries.findLast(
-				(entry) => entry.cacheControl !== undefined,
-			)?.cacheControl;
-			const prefixBlock = {
-				type: "text",
-				text: prefix,
-				...(prefixCacheControl
-					? { cache_control: prefixCacheControl }
+	const placement = ctx.systemTextPlacement ?? "first-user";
+	const anchor = placement === "anchor" ? findAnchor(messages) : undefined;
+	if (movedEntries.length > 0 && placement !== "drop") {
+		const prefix = movedEntries.map((entry) => entry.text).join("\n\n");
+		const prefixCacheControl = movedEntries.findLast(
+			(entry) => entry.cacheControl !== undefined,
+		)?.cacheControl;
+		const prefixBlock = {
+			type: "text",
+			text: prefix,
+			...(prefixCacheControl
+				? { cache_control: prefixCacheControl }
+				: {}),
+		};
+		const firstUser = anchor
+			? undefined
+			: messages.find((m) => m.role === "user");
+		if (anchor) {
+			// The anchor keeps the conversation breakpoint pi-ai put on it when it
+			// was the last user message.
+			const anchorCacheControl = anchor.block.cache_control;
+			anchor.content[anchor.index] = {
+				...prefixBlock,
+				...(prefixCacheControl === undefined && anchorCacheControl !== undefined
+					? { cache_control: anchorCacheControl }
 					: {}),
 			};
+		} else if (firstUser) {
 			const content = firstUser.content;
 			if (typeof content === "string") {
 				firstUser.content = [

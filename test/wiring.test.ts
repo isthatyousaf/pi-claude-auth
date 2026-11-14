@@ -130,7 +130,7 @@ describe("extension wiring (Pi owns the OAuth lifecycle)", () => {
 					},
 				},
 			},
-			sessionManager: { getBranch: () => [] },
+			sessionManager: { getBranch: () => [], getEntries: () => [] },
 			ui: { custom: async () => {} },
 		};
 		for (const handler of spy.handlers.session_start ?? []) {
@@ -152,7 +152,7 @@ describe("extension wiring (Pi owns the OAuth lifecycle)", () => {
 		let customCalled = false;
 		const ctx = {
 			mode: "tui",
-			sessionManager: { getBranch: () => [] },
+			sessionManager: { getBranch: () => [], getEntries: () => [] },
 			ui: {
 				notify(message: string, kind: string) {
 					notifications.push({ message, kind });

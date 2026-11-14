@@ -22,6 +22,9 @@ Verified byte-for-byte against real Claude Code 2.1.295 first-party traffic
   Agent SDK." (SDK/non-interactive shape; interactive CC sends the legacy
   line). `src/transforms.ts` swaps pi's legacy identity and relocates all
   other system text into the first user message — mandatory for plan billing.
+  After an Anthropic server compaction (`src/server-compaction.ts`) the text
+  goes to an anchor right after that compaction's kept turns instead, because
+  text inside a kept turn invalidates its thinking.
 - Transport headers: `user-agent: claude-cli/<ver> (external, sdk-cli)`,
   `x-app: cli`, `x-claude-code-session-id`, per-request `x-client-request-id`,
   `x-claude-code-prompt-id` (mirrors cc_prompt_id),
