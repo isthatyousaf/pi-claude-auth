@@ -485,6 +485,29 @@ describe("server compaction through the provider", () => {
 		expect(await compact(branch, "u2")).toBeDefined();
 	});
 
+	it("accepts a stable message a context handler injects into every request [round 4]", async () => {
+		const branch = chain(sys("s"), user("u1"), assistant("a1"), user("u2"), assistant("a2"), user("u3"));
+		const sent = await sessionRequest(branch);
+		const injected = { role: "user", content: [{ type: "text", text: "injected reminder" }], timestamp: 5 } as Message;
+		const agentBody = await agentRequest([sent[0], injected, ...sent.slice(1)]);
+		expect(JSON.stringify(agentBody.messages)).toContain("injected reminder");
+		const result = await compact(branch, "u2");
+		expect(result?.compaction.summary).toBe("Summary 1");
+		expect(JSON.stringify(compactionBodies()[0].messages)).toContain("injected reminder");
+	});
+
+	it("accepts a stable plan-mode style filter that hides messages from every request [round 4]", async () => {
+		const planContext = { type: "custom_message", id: "plan", customType: "plan-mode-context", content: "plan context", display: false };
+		const branch = chain(sys("s"), user("u1"), planContext, assistant("a1"), user("u2"), assistant("a2"), user("u3"));
+		// Like Pi's plan-mode example, the context handler drops plan-mode-context messages.
+		const sent = (await sessionRequest(branch)).filter((m) => !JSON.stringify(m.content).includes("plan context"));
+		const agentBody = await agentRequest(sent);
+		expect(JSON.stringify(agentBody.messages)).not.toContain("plan context");
+		const result = await compact(branch, "u2");
+		expect(result?.compaction.summary).toBe("Summary 1");
+		expect(JSON.stringify(compactionBodies()[0].messages)).not.toContain("plan context");
+	});
+
 	it("keeps the active anchor on the kept side when a repeated compaction cuts right after it [finding 6]", async () => {
 		rememberCompactionBlock("First", { type: "compaction", content: "First", signature: "sig-first" });
 		let branch = chain(sys("s"), user("u1"), assistant("a1"), user("u2"), assistant("a2"));

@@ -14,6 +14,7 @@ import { log } from "./logger.ts";
 import { buildUserAgent } from "./signing.ts";
 import {
 	applyServerCompactionPayload,
+	canonicalMessagesFor,
 	contextCarriesCompactionBlock,
 	isAgentPayload,
 	payloadDeclarationsKey,
@@ -97,6 +98,7 @@ function mergeClaudeCodeOptions<T extends StreamOptions>(
 					messages: [...context.messages],
 					wire: wireMessageRecords(current),
 					declarationsKey: payloadDeclarationsKey(current),
+					canonical: canonicalMessagesFor(options.sessionId),
 					cacheRetention: options.cacheRetention,
 				});
 			}

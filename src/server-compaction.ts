@@ -346,6 +346,8 @@ export interface AgentRequestRecord {
 	wire: readonly WireMessageRecord[];
 	/** `tools` and `system` of the payload, compared by {@link payloadDeclarationsKey}. */
 	declarationsKey: string;
+	/** The session's {@link canonicalMessages} when the request was built. */
+	canonical?: readonly Message[];
 	cacheRetention?: unknown;
 }
 
@@ -405,6 +407,34 @@ export function lastAgentRequest(sessionId: string): AgentRequestRecord | undefi
 
 export function forgetAgentRequests(): void {
 	agentRequest = undefined;
+}
+
+/**
+ * The session transcript as Pi converts it for a request, before any context
+ * handler: the canonical form the summarized messages are compared in.
+ */
+export function canonicalMessages(entries: SessionProjection["entries"]): Message[] {
+	return (
+		convertToLlm(entries.flatMap((entry) => entry.messages) as never) as Message[]
+	).filter((message) => message.role !== "system");
+}
+
+// Taken by the context hook of each agent request and attached to that
+// request's record by the overlay.
+let canonicalSnapshot: { sessionId: string; messages: readonly Message[] } | undefined;
+
+export function rememberCanonicalMessages(sessionId: string, messages: readonly Message[]): void {
+	canonicalSnapshot = { sessionId, messages };
+}
+
+export function canonicalMessagesFor(sessionId: string | undefined): readonly Message[] | undefined {
+	return sessionId !== undefined && canonicalSnapshot?.sessionId === sessionId
+		? canonicalSnapshot.messages
+		: undefined;
+}
+
+export function forgetCanonicalMessages(): void {
+	canonicalSnapshot = undefined;
 }
 
 /**
@@ -765,6 +795,8 @@ export type CompactionRequestMessages =
  */
 export function buildCompactionRequestMessages(options: {
 	request: readonly Message[];
+	/** {@link canonicalMessages} of the session when the request was sent. */
+	canonical?: readonly Message[];
 	projection: SessionProjection;
 	firstKeptEntryId: string;
 	model: string;
@@ -801,19 +833,17 @@ export function buildCompactionRequestMessages(options: {
 	const nextRole = anchorKept ? "user" : firstKept ? wireRole(firstKept, model) : undefined;
 	if (nextRole === lastRole) return fail("the cut splits a turn");
 
-	// The summarized messages Pi would send now must be the ones the last
-	// request sent; a context edit since then changes them.
+	// The summarized transcript must be the one the last request was built
+	// from; a context edit since then changes it. Both sides are canonical
+	// (before context handlers), so stable handler projections still pass.
 	const comparable = (message: Message) =>
 		JSON.stringify([message.role, message.timestamp, message.content]);
-	const summarizedNow = (
-		convertToLlm(projection.entries.slice(0, cut).flatMap((entry) => entry.messages) as never) as Message[]
-	).filter((message) => message.role !== "system");
-	const summarizedSent = request
-		.slice(0, cutIndex)
-		.filter((message) => message.role !== "system" && !isAnchorMessage(message));
+	const summarizedNow = canonicalMessages(projection.entries.slice(0, cut));
+	const canonical = options.canonical;
 	if (
-		summarizedNow.length !== summarizedSent.length ||
-		summarizedNow.some((message, i) => comparable(message) !== comparable(summarizedSent[i]))
+		!canonical ||
+		summarizedNow.length > canonical.length ||
+		summarizedNow.some((message, i) => comparable(message) !== comparable(canonical[i]))
 	)
 		return fail("the session changed since the last request");
 
@@ -1006,6 +1036,7 @@ async function compactOnServer(event: SessionBeforeCompactEvent, ctx: ExtensionC
 	rememberCompactionBlocks(event.branchEntries);
 	const request = buildCompactionRequestMessages({
 		request: last.messages,
+		canonical: last.canonical,
 		projection: buildSessionProjection(event.branchEntries),
 		firstKeptEntryId: preparation.firstKeptEntryId,
 		model: model.id,
@@ -1090,6 +1121,8 @@ async function anchorAgentRequest<T extends TimedMessage>(
 	const branch = ctx.sessionManager.getBranch();
 	rememberCompactionBlocks(branch);
 	const projection = ctx.sessionManager.buildSessionProjection();
+	// Context hooks run right before the agent request they belong to.
+	rememberCanonicalMessages(ctx.sessionManager.getSessionId(), canonicalMessages(projection.entries));
 	const anchorIndex = findAnchorIndex(branch, projection);
 	if (anchorIndex === undefined) return undefined;
 	const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
@@ -1104,17 +1137,21 @@ export function registerServerCompaction(pi: ExtensionAPI): void {
 	// continued after either changes.
 	pi.on("session_start", (_event, ctx) => {
 		forgetAgentRequests();
+		forgetCanonicalMessages();
 		rememberCompactionBlocks(ctx.sessionManager.getEntries());
 	});
 	pi.on("session_shutdown", () => {
 		forgetAgentRequests();
+		forgetCanonicalMessages();
 	});
 	pi.on("session_tree", (_event, ctx) => {
 		forgetAgentRequests();
+		forgetCanonicalMessages();
 		rememberCompactionBlocks(ctx.sessionManager.getBranch());
 	});
 	pi.on("session_compact", (event) => {
 		forgetAgentRequests();
+		forgetCanonicalMessages();
 		rememberCompactionBlocks([event.compactionEntry]);
 	});
 	// Every agent request first forgets the record; the overlay records it
@@ -1126,6 +1163,7 @@ export function registerServerCompaction(pi: ExtensionAPI): void {
 	});
 	pi.on("model_select", () => {
 		forgetAgentRequests();
+		forgetCanonicalMessages();
 	});
 	pi.on("session_before_compact", async (event, ctx) => {
 		try {

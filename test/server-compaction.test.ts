@@ -11,6 +11,7 @@ import {
 	applyServerCompactionPayload,
 	buildCompactionInstructions,
 	buildCompactionRequestMessages,
+	canonicalMessages,
 	COMPACT_BETA,
 	type CompactionBlock,
 	contextCarriesCompactionBlock,
@@ -495,6 +496,7 @@ function agentRequest(branch: SessionEntry[]) {
 function build(branch: SessionEntry[], firstKeptEntryId: string, request = agentRequest(branch), provider = "anthropic") {
 	return buildCompactionRequestMessages({
 		request,
+		canonical: canonicalMessages(buildSessionProjection(branch).entries),
 		projection: buildSessionProjection(branch),
 		firstKeptEntryId,
 		model: "claude-haiku-5-5",
@@ -836,6 +838,7 @@ describe("session_before_compact handler", () => {
 		recordAgentRequest("sess", {
 			modelId: "claude-haiku-5-5",
 			messages: agentRequest(branch),
+			canonical: canonicalMessages(buildSessionProjection(branch).entries),
 			declarationsKey: payloadDeclarationsKey({}),
 		});
 		return {
