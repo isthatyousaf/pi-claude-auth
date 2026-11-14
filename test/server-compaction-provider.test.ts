@@ -119,6 +119,7 @@ describe("server compaction through the provider", () => {
 	let bodies: Body[];
 	let handlers: Record<string, Handler[]>;
 	let compactions: number;
+	let compactionGate: Promise<void> | undefined;
 
 	beforeEach(async () => {
 		dir = mkdtempSync(join(tmpdir(), "pi-claude-auth-compaction-"));
@@ -128,10 +129,14 @@ describe("server compaction through the provider", () => {
 		writeFileSync(join(dir, "models.json"), "{}");
 		bodies = [];
 		compactions = 0;
+		compactionGate = undefined;
 		globalThis.fetch = (async (_input: unknown, init?: RequestInit) => {
 			const body = JSON.parse(String(init?.body));
 			bodies.push(body);
-			if (body.compaction) return compactionResponse("Summary " + ++compactions);
+			if (body.compaction) {
+				await compactionGate;
+				return compactionResponse("Summary " + ++compactions);
+			}
 			return new Response(JSON.stringify({ type: "error", error: { type: "api_error", message: "stub" } }), {
 				status: 500,
 				headers: { "content-type": "application/json" },
@@ -213,7 +218,32 @@ describe("server compaction through the provider", () => {
 		return bodies[before];
 	}
 
-	/** The agent context Pi would send on \`branch\`, after this extension's context hook. */
+	/**
+	 * Send a provider request with Pi's before_provider_request handlers.
+	 * `pause` runs after them, like a slow handler of another extension.
+	 */
+	async function send(
+		target: Model<Api>,
+		context: { messages: Message[] },
+		options: { apiKey?: string; signal?: AbortSignal; maxTokens?: number; pause?: () => Promise<void> } = {},
+	) {
+		const stream = runtime.streamSimple(target, context, {
+			apiKey: options.apiKey ?? OAUTH_TOKEN,
+			sessionId: SESSION,
+			maxRetries: 0,
+			reasoning: "high",
+			signal: options.signal,
+			maxTokens: options.maxTokens,
+			onPayload: async (payload: unknown) => {
+				for (const handler of handlers.before_provider_request ?? []) await handler({ type: "before_provider_request", payload }, {});
+				await options.pause?.();
+				return undefined;
+			},
+		} as never);
+		await stream.result();
+	}
+
+	/** The agent context Pi would send on `branch`, after this extension's context hook. */
 	async function sessionRequest(branch: SessionEntry[]): Promise<Message[]> {
 		const projection = buildSessionProjection(branch);
 		let messages = projection.messages as unknown[];
@@ -411,61 +441,39 @@ describe("server compaction through the provider", () => {
 	});
 
 	it("records agent requests only when server compaction can apply [round 2, finding 5]", async () => {
-		const messages = await sessionRequest(chain(sys("s"), user("u1")));
+		const branch = chain(sys("s"), user("u1"));
 		process.env.PI_CLAUDE_AUTH_SERVER_COMPACTION = "0";
-		await agentRequest(messages);
+		await agentRequest(await sessionRequest(branch));
 		expect(lastAgentRequest(SESSION)).toBeUndefined();
 		delete process.env.PI_CLAUDE_AUTH_SERVER_COMPACTION;
 
 		const older = runtime.getModels("anthropic").find((m) => m.id === "claude-haiku-4-5");
 		if (!older) throw new Error("claude-haiku-4-5 missing from the catalog");
-		const stream = runtime.streamSimple(older, { messages }, {
-			apiKey: OAUTH_TOKEN,
-			sessionId: SESSION,
-			maxRetries: 0,
-			onPayload: async (payload: unknown) => {
-				for (const handler of handlers.before_provider_request ?? []) await handler({ type: "before_provider_request", payload }, {});
-				return undefined;
-			},
-		} as never);
-		await stream.result();
+		await send(older, { messages: await sessionRequest(branch) });
 		expect(lastAgentRequest(SESSION)).toBeUndefined();
 
-		await agentRequest(messages);
+		await agentRequest(await sessionRequest(branch));
 		expect(lastAgentRequest(SESSION)?.modelId).toBe("claude-haiku-5-5");
 		expect(lastAgentRequest("another-session")).toBeUndefined();
 	});
 
 	it("forgets the record when a request goes to another model or auth, or the model changes [round 3, finding 1]", async () => {
 		const branch = chain(sys("s", [tool("one")]), user("u1"), assistant("a1"), user("u2"), assistant("a2"), user("u3"));
-		const messages = await sessionRequest(branch);
 		const older = runtime.getModels("anthropic").find((m) => m.id === "claude-haiku-4-5");
 		if (!older) throw new Error("claude-haiku-4-5 missing from the catalog");
-		const send = async (target: Model<Api>, apiKey: string) => {
-			const stream = runtime.streamSimple(target, { messages }, {
-				apiKey,
-				sessionId: SESSION,
-				maxRetries: 0,
-				onPayload: async (payload: unknown) => {
-					for (const handler of handlers.before_provider_request ?? []) await handler({ type: "before_provider_request", payload }, {});
-					return undefined;
-				},
-			} as never);
-			await stream.result();
-		};
 
-		await agentRequest(messages);
-		await send(older, OAUTH_TOKEN);
+		await agentRequest(await sessionRequest(branch));
+		await send(older, { messages: await sessionRequest(branch) });
 		expect(lastAgentRequest(SESSION)).toBeUndefined();
 		// Back on the supported model, compaction must not reuse the request recorded before the switch.
 		expect(await compact(branch, "u2")).toBeUndefined();
 		expect(compactionBodies()).toHaveLength(0);
 
-		await agentRequest(messages);
-		await send(model, "sk-ant-api03-test-key");
+		await agentRequest(await sessionRequest(branch));
+		await send(model, { messages: await sessionRequest(branch) }, { apiKey: "sk-ant-api03-test-key" });
 		expect(lastAgentRequest(SESSION)).toBeUndefined();
 
-		await agentRequest(messages);
+		await agentRequest(await sessionRequest(branch));
 		for (const handler of handlers.model_select ?? []) await handler({ type: "model_select", model: older }, ctx(branch));
 		expect(lastAgentRequest(SESSION)).toBeUndefined();
 	});
@@ -506,6 +514,65 @@ describe("server compaction through the provider", () => {
 		const result = await compact(branch, "u2");
 		expect(result?.compaction.summary).toBe("Summary 1");
 		expect(JSON.stringify(compactionBodies()[0].messages)).not.toContain("plan context");
+	});
+
+	it("ignores a delayed, aborted cache-warming replay of an older request [round 5]", async () => {
+		const branch = chain(sys("s"), user("u1"), assistant("a1"), user("u2"), assistant("a2"), user("u3"));
+		const older = { messages: await sessionRequest(branch) };
+		await send(model, older);
+		expect(JSON.stringify(lastAgentRequest(SESSION)?.messages)).toContain("prompt u1");
+
+		// The cache warmer replays the older request; a slow handler holds it.
+		let release = () => {};
+		const held = new Promise<void>((resolve) => (release = resolve));
+		const warmer = new AbortController();
+		const replay = send(model, older, { signal: warmer.signal, maxTokens: 1, pause: () => held });
+
+		// Meanwhile u1 is omitted and a newer request goes out.
+		const [edit] = chain({ type: "context_edit", id: "edit", targetId: "u1", replacement: null });
+		(edit as { parentId: string }).parentId = "u3";
+		const edited = [...branch, edit];
+		const newer = { messages: await sessionRequest(edited) };
+		await send(model, newer);
+		expect(JSON.stringify(lastAgentRequest(SESSION)?.messages)).not.toContain("prompt u1");
+
+		// The newer request restarts warming, which aborts the old replay; it then resumes.
+		warmer.abort();
+		release();
+		await replay;
+		expect(JSON.stringify(lastAgentRequest(SESSION)?.messages)).not.toContain("prompt u1");
+
+		// A replay that was not aborted is ignored too, and so is a replay of the newer request.
+		await send(model, older, { maxTokens: 1 });
+		await send(model, newer, { maxTokens: 1 });
+		expect(JSON.stringify(lastAgentRequest(SESSION)?.messages)).not.toContain("prompt u1");
+
+		const result = await compact(edited, "u2");
+		expect(result?.compaction.summary).toBe("Summary 1");
+		expect(JSON.stringify(compactionBodies()[0].messages)).not.toContain("prompt u1");
+	});
+
+	it("falls back when another request took the hook state of the agent request [round 5]", async () => {
+		const branch = chain(sys("s"), user("u1"), assistant("a1"), user("u2"), assistant("a2"), user("u3"));
+		const messages = await sessionRequest(branch);
+		// A request of another extension reaches the overlay between the hook and the agent request.
+		await runtime.streamSimple(model, { messages: [...messages] }, { apiKey: OAUTH_TOKEN, sessionId: SESSION, maxRetries: 0 } as never).result();
+		await agentRequest(messages);
+		expect(lastAgentRequest(SESSION)).toBeUndefined();
+		expect(await compact(branch, "u2")).toBeUndefined();
+	});
+
+	it("discards a compaction that finishes after the session changed [round 5]", async () => {
+		const branch = chain(sys("s"), user("u1"), assistant("a1"), user("u2"), assistant("a2"), user("u3"));
+		await agentRequest(await sessionRequest(branch));
+		let release = () => {};
+		compactionGate = new Promise<void>((resolve) => (release = resolve));
+		const pending = compact(branch, "u2");
+		while (compactionBodies().length === 0) await new Promise((resolve) => setTimeout(resolve, 1));
+		for (const handler of handlers.session_tree ?? []) await handler({ type: "session_tree" }, ctx(branch));
+		release();
+		expect(await pending).toBeUndefined();
+		expect(compactionBodies()).toHaveLength(1);
 	});
 
 	it("keeps the active anchor on the kept side when a repeated compaction cuts right after it [finding 6]", async () => {

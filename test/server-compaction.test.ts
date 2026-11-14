@@ -10,6 +10,7 @@ import {
 	ANCHOR_TEXT,
 	applyServerCompactionPayload,
 	buildCompactionInstructions,
+	beginAgentRequest,
 	buildCompactionRequestMessages,
 	canonicalMessages,
 	COMPACT_BETA,
@@ -835,10 +836,9 @@ describe("session_before_compact handler", () => {
 	}
 	function ctx(r: FakeRun, apiKey = "sk-ant-oat01-x", model: unknown = MODEL) {
 		const notices: string[] = [];
-		recordAgentRequest("sess", {
+		recordAgentRequest(beginAgentRequest("sess", canonicalMessages(buildSessionProjection(branch).entries)), "sess", {
 			modelId: "claude-haiku-5-5",
 			messages: agentRequest(branch),
-			canonical: canonicalMessages(buildSessionProjection(branch).entries),
 			declarationsKey: payloadDeclarationsKey({}),
 		});
 		return {

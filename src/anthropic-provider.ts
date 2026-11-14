@@ -14,7 +14,7 @@ import { log } from "./logger.ts";
 import { buildUserAgent } from "./signing.ts";
 import {
 	applyServerCompactionPayload,
-	canonicalMessagesFor,
+	claimAgentRequestContext,
 	contextCarriesCompactionBlock,
 	isAgentPayload,
 	payloadDeclarationsKey,
@@ -64,7 +64,8 @@ function oneHourCacheEnabled(): boolean {
  *   block: the API rejects threads on them, and pi-ai would otherwise spend a
  *   rejected request finding that out.
  * - Records each agent request, which a server compaction request continues
- *   ({@link recordAgentRequest}).
+ *   ({@link recordAgentRequest}), tied to the context hook state of that
+ *   request ({@link claimAgentRequestContext}).
  *
  * Only applied to OAuth tokens (`sk-ant-oat`); plain API-key requests pass
  * through the built-in provider untouched and bill normally on their own.
@@ -76,6 +77,8 @@ function mergeClaudeCodeOptions<T extends StreamOptions>(
 ): T {
 	const originalOnPayload = options.onPayload;
 	const transport = options.fetch ?? globalThis.fetch;
+	// Claimed before any await, so the hook state stays with this request.
+	const agentRequest = claimAgentRequestContext(context.messages);
 	return {
 		...options,
 		// Claude Code uses ENABLE_PROMPT_CACHING_1H to force ttl="1h". Pi's
@@ -93,14 +96,18 @@ function mergeClaudeCodeOptions<T extends StreamOptions>(
 				recordsAgentRequests(model.id) &&
 				(isAgentPayload(payload) || isAgentPayload(current))
 			) {
-				recordAgentRequest(options.sessionId, {
-					modelId: model.id,
-					messages: [...context.messages],
-					wire: wireMessageRecords(current),
-					declarationsKey: payloadDeclarationsKey(current),
-					canonical: canonicalMessagesFor(options.sessionId),
-					cacheRetention: options.cacheRetention,
-				});
+				recordAgentRequest(
+					agentRequest,
+					options.sessionId,
+					{
+						modelId: model.id,
+						messages: [...context.messages],
+						wire: wireMessageRecords(current),
+						declarationsKey: payloadDeclarationsKey(current),
+						cacheRetention: options.cacheRetention,
+					},
+					options.signal?.aborted,
+				);
 			}
 			try {
 				const systemTextPlacement = applyServerCompactionPayload(current);

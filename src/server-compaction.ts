@@ -354,9 +354,53 @@ export interface AgentRequestRecord {
 // Pi emits before_provider_request only for agent requests. Its handler marks
 // the payload, and the overlay records the request when it sees that payload.
 const agentPayloads = new WeakSet<object>();
-// Only the current session's last request is kept; anything that changes the
-// branch or the session forgets it.
-let agentRequest: { sessionId: string; record: AgentRequestRecord } | undefined;
+
+/**
+ * One agent request as this extension's context hook saw it. The hook starts
+ * a new generation for every agent request, whatever its model or auth; only
+ * a record of the latest generation counts.
+ */
+export interface AgentRequestContext {
+	sessionId: string;
+	generation: number;
+	/** {@link canonicalMessages} of the session when the hook ran; unset when it cannot apply. */
+	canonical?: readonly Message[];
+	recorded?: boolean;
+}
+
+let generationCounter = 0;
+let latestGeneration = 0;
+// Taken by the hook and claimed by the overlay when the request reaches it.
+let pendingRequest: AgentRequestContext | undefined;
+// Pi converts the messages into a new array for every agent request, and a
+// cache-warming replay reuses its request's array (pi-ai copies the Context
+// object, not the array), so the array identifies the request across the
+// awaits between the overlay's entry and the payload transform. An array the
+// overlay saw without a pending request maps to null.
+const requestContexts = new WeakMap<object, AgentRequestContext | null>();
+let agentRequest: { context: AgentRequestContext; record: AgentRequestRecord } | undefined;
+
+/** Called by the context hook of each agent request, before any await. */
+export function beginAgentRequest(sessionId: string, canonical?: readonly Message[]): AgentRequestContext {
+	latestGeneration = ++generationCounter;
+	pendingRequest = { sessionId, generation: latestGeneration, canonical };
+	return pendingRequest;
+}
+
+/**
+ * The agent request a provider request belongs to. Call it synchronously when
+ * the request enters the overlay: the first request with a new message array
+ * claims the pending hook state; later ones with that array (replays) get the
+ * same state, or none.
+ */
+export function claimAgentRequestContext(messages: readonly unknown[]): AgentRequestContext | undefined {
+	if (!Array.isArray(messages)) return undefined;
+	if (requestContexts.has(messages)) return requestContexts.get(messages) ?? undefined;
+	const claimed = pendingRequest ?? null;
+	pendingRequest = undefined;
+	requestContexts.set(messages, claimed);
+	return claimed ?? undefined;
+}
 
 export function markAgentPayload(payload: unknown): void {
 	if (payload && typeof payload === "object") agentPayloads.add(payload);
@@ -394,19 +438,43 @@ export function recordsAgentRequests(modelId: string): boolean {
 	return serverCompactionEnabled() && supportsServerCompaction(modelId);
 }
 
+/**
+ * Record an agent request once its payload is final. Only the first payload
+ * of a request of the latest generation counts: a replay, an aborted request
+ * or a request older than the last agent request or the last
+ * {@link forgetAgentRequests} is ignored. Returns whether it was recorded.
+ */
 export function recordAgentRequest(
+	context: AgentRequestContext | undefined,
 	sessionId: string | undefined,
-	record: AgentRequestRecord,
-): void {
-	agentRequest = sessionId ? { sessionId, record } : undefined;
+	record: Omit<AgentRequestRecord, "canonical">,
+	aborted = false,
+): boolean {
+	if (!context || context.recorded || aborted) return false;
+	if (context.sessionId !== sessionId || context.generation !== latestGeneration) return false;
+	context.recorded = true;
+	agentRequest = { context, record: { ...record, canonical: context.canonical } };
+	return true;
+}
+
+/** Changes whenever a recorded request stops counting. */
+export function agentRequestGeneration(): number {
+	return latestGeneration;
 }
 
 export function lastAgentRequest(sessionId: string): AgentRequestRecord | undefined {
-	return agentRequest?.sessionId === sessionId ? agentRequest.record : undefined;
+	return agentRequest &&
+		agentRequest.context.sessionId === sessionId &&
+		agentRequest.context.generation === latestGeneration
+		? agentRequest.record
+		: undefined;
 }
 
+/** Make every request so far stale, including ones still in flight. */
 export function forgetAgentRequests(): void {
 	agentRequest = undefined;
+	pendingRequest = undefined;
+	latestGeneration = ++generationCounter;
 }
 
 /**
@@ -417,24 +485,6 @@ export function canonicalMessages(entries: SessionProjection["entries"]): Messag
 	return (
 		convertToLlm(entries.flatMap((entry) => entry.messages) as never) as Message[]
 	).filter((message) => message.role !== "system");
-}
-
-// Taken by the context hook of each agent request and attached to that
-// request's record by the overlay.
-let canonicalSnapshot: { sessionId: string; messages: readonly Message[] } | undefined;
-
-export function rememberCanonicalMessages(sessionId: string, messages: readonly Message[]): void {
-	canonicalSnapshot = { sessionId, messages };
-}
-
-export function canonicalMessagesFor(sessionId: string | undefined): readonly Message[] | undefined {
-	return sessionId !== undefined && canonicalSnapshot?.sessionId === sessionId
-		? canonicalSnapshot.messages
-		: undefined;
-}
-
-export function forgetCanonicalMessages(): void {
-	canonicalSnapshot = undefined;
 }
 
 /**
@@ -1031,6 +1081,9 @@ async function compactOnServer(event: SessionBeforeCompactEvent, ctx: ExtensionC
 	};
 
 	const last = lastAgentRequest(ctx.sessionManager.getSessionId());
+	// The summary is only valid for the request it continues; anything that
+	// made that request stale while compaction awaited the API discards it.
+	const generation = agentRequestGeneration();
 	if (!last || last.modelId !== model.id)
 		return fallback(`no earlier request to ${model.id} in this session since Pi started`);
 	rememberCompactionBlocks(event.branchEntries);
@@ -1076,13 +1129,20 @@ async function compactOnServer(event: SessionBeforeCompactEvent, ctx: ExtensionC
 	// A refused request generates nothing and costs nothing; the file lists are
 	// the part of the instructions most likely to be refused, so retry once
 	// without them.
-	if (!outcome.ok && outcome.stopReason === "refusal" && readFiles.length + modifiedFiles.length > 0) {
+	if (
+		!outcome.ok &&
+		outcome.stopReason === "refusal" &&
+		readFiles.length + modifiedFiles.length > 0 &&
+		agentRequestGeneration() === generation
+	) {
 		log("server_compaction_retry", { reason: outcome.reason });
 		outcome = await attempt(
 			buildCompactionInstructions({ customInstructions: event.customInstructions }),
 		);
 	}
 	if (!outcome.ok) return fallback(outcome.reason);
+	if (agentRequestGeneration() !== generation)
+		return fallback("the session changed while Anthropic was compacting");
 
 	rememberCompactionBlock(outcome.block.content, outcome.block);
 	log("server_compaction", {
@@ -1121,8 +1181,6 @@ async function anchorAgentRequest<T extends TimedMessage>(
 	const branch = ctx.sessionManager.getBranch();
 	rememberCompactionBlocks(branch);
 	const projection = ctx.sessionManager.buildSessionProjection();
-	// Context hooks run right before the agent request they belong to.
-	rememberCanonicalMessages(ctx.sessionManager.getSessionId(), canonicalMessages(projection.entries));
 	const anchorIndex = findAnchorIndex(branch, projection);
 	if (anchorIndex === undefined) return undefined;
 	const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
@@ -1137,33 +1195,25 @@ export function registerServerCompaction(pi: ExtensionAPI): void {
 	// continued after either changes.
 	pi.on("session_start", (_event, ctx) => {
 		forgetAgentRequests();
-		forgetCanonicalMessages();
 		rememberCompactionBlocks(ctx.sessionManager.getEntries());
 	});
 	pi.on("session_shutdown", () => {
 		forgetAgentRequests();
-		forgetCanonicalMessages();
 	});
 	pi.on("session_tree", (_event, ctx) => {
 		forgetAgentRequests();
-		forgetCanonicalMessages();
 		rememberCompactionBlocks(ctx.sessionManager.getBranch());
 	});
 	pi.on("session_compact", (event) => {
 		forgetAgentRequests();
-		forgetCanonicalMessages();
 		rememberCompactionBlocks([event.compactionEntry]);
 	});
-	// Every agent request first forgets the record; the overlay records it
-	// again only for an OAuth request to a supported model, so a request to any
-	// other model, provider or auth leaves no stale record behind.
+	// Cache-warming replays also pass here; they must not touch the record.
 	pi.on("before_provider_request", (event) => {
-		forgetAgentRequests();
 		markAgentPayload(event.payload);
 	});
 	pi.on("model_select", () => {
 		forgetAgentRequests();
-		forgetCanonicalMessages();
 	});
 	pi.on("session_before_compact", async (event, ctx) => {
 		try {
@@ -1176,6 +1226,16 @@ export function registerServerCompaction(pi: ExtensionAPI): void {
 		}
 	});
 	pi.on("context_with_system", async (event, ctx) => {
+		// Every agent request, on any model or auth, makes older records stale.
+		// The snapshot is taken before any await, with the messages Pi built.
+		let canonical: Message[] | undefined;
+		try {
+			if (serverCompactionEnabled() && eligibleModel(ctx.model))
+				canonical = canonicalMessages(ctx.sessionManager.buildSessionProjection().entries);
+		} catch {
+			// Without a snapshot the request is recorded but never continued.
+		}
+		beginAgentRequest(ctx.sessionManager.getSessionId(), canonical);
 		try {
 			const messages = await anchorAgentRequest(event.messages, ctx);
 			return messages ? { messages } : undefined;
