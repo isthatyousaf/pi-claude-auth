@@ -197,7 +197,39 @@ describe("applyServerCompactionPayload", () => {
 		const p = payload([summaryMessage()]);
 		p.tools = [two, { ...one, cache_control: { type: "ephemeral" } }];
 		applyServerCompactionPayload(p);
-		expect(p.tools).toEqual([one, two]);
+		expect(p.tools).toEqual([one, { ...two, cache_control: { type: "ephemeral" } }]);
+	});
+
+	it("restores saved tools with the current request's cache breakpoints, not the saved ones", () => {
+		const def = (name: string) => ({ name, input_schema: {} });
+		const placeholder = { name: "__pi_deferred_placeholder__", input_schema: {} };
+		const short = { type: "ephemeral" };
+		const long = { type: "ephemeral", ttl: "1h" };
+		rememberCompactionBlock(BLOCK.content, BLOCK, {
+			requestTools: [def("one"), { ...def("two"), cache_control: short }, placeholder],
+			effectiveTools: [def("one"), def("two"), placeholder],
+		});
+		const p = payload([summaryMessage()]);
+		p.tools = [def("two"), { ...def("one"), cache_control: long }, placeholder];
+		applyServerCompactionPayload(p);
+		expect(p.tools).toEqual([def("one"), { ...def("two"), cache_control: long }, placeholder]);
+	});
+
+	it("restores tools after recorded tool changes with the current cache breakpoint", () => {
+		const def = (name: string) => ({ name, input_schema: {} });
+		const placeholder = { name: "__pi_deferred_placeholder__" };
+		const long = { type: "ephemeral", ttl: "1h" };
+		const block = { ...BLOCK, tool_changes: [{ type: "tool_addition", name: "two" }] };
+		rememberCompactionBlock(block.content, block, {
+			requestTools: [{ ...def("one"), cache_control: { type: "ephemeral" } }, placeholder],
+			effectiveTools: [def("one"), def("two")],
+		});
+		const p = payload([summaryMessage()]);
+		p.betas = ["oauth-2025-04-20", "inline-tools-2026-09-15"];
+		p.tools = [def("one"), { ...def("two"), cache_control: long }, placeholder];
+		applyServerCompactionPayload(p);
+		expect(p.messages[0].content[0].type).toBe("compaction");
+		expect(p.tools).toEqual([{ ...def("one"), cache_control: long }, placeholder]);
 	});
 
 	it("applies inline tool changes in order", () => {

@@ -377,7 +377,7 @@ function hasBeta(payload: WirePayload, beta: string): boolean {
 function fitCompactionTools(p: WirePayload, known: KnownCompaction): boolean {
 	if (!hasRecordedToolChanges(known.block)) {
 		if (known.requestTools && Array.isArray(p.tools) && toolsKey(p.tools) === toolsKey(known.requestTools))
-			p.tools = structuredClone(known.requestTools);
+			p.tools = restoreTools(p.tools, known.requestTools);
 		return true;
 	}
 	if (
@@ -388,8 +388,26 @@ function fitCompactionTools(p: WirePayload, known: KnownCompaction): boolean {
 		toolsKey(p.tools) !== toolsKey(known.effectiveTools)
 	)
 		return false;
-	p.tools = structuredClone(known.requestTools);
+	p.tools = restoreTools(p.tools, known.requestTools);
 	return true;
+}
+
+/**
+ * The saved tools in the compaction request's order, with the current request's
+ * cache breakpoints. Saved breakpoints may carry an older TTL, and Anthropic
+ * rejects a shorter TTL ahead of a longer one. pi-ai places its tool breakpoint
+ * a fixed distance from the end (before its placeholder, if any), so each
+ * current breakpoint moves to the same distance from the end.
+ */
+function restoreTools(current: unknown[], saved: unknown[]): unknown[] {
+	const restored = withoutCacheControlValue(saved) as WireTool[];
+	current.forEach((tool, i) => {
+		const cacheControl = (tool as WireTool | undefined)?.cache_control;
+		const j = restored.length - (current.length - i);
+		if (cacheControl !== undefined && j >= 0)
+			restored[j] = { ...restored[j], cache_control: structuredClone(cacheControl) };
+	});
+	return restored;
 }
 
 function systemText(system: unknown): string {
