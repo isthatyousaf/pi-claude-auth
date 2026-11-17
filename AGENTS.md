@@ -24,7 +24,12 @@ Verified byte-for-byte against real Claude Code 2.1.295 first-party traffic
   other system text into the first user message — mandatory for plan billing.
   After an Anthropic server compaction (`src/server-compaction.ts`) the text
   goes to an anchor right after that compaction's kept turns instead, because
-  text inside a kept turn invalidates its thinking.
+  text inside a kept turn invalidates its thinking. API-key requests skip the
+  billing transform but still get server compaction
+  (`mergeServerCompactionOptions` in `src/anthropic-provider.ts`).
+- Server-compaction fallbacks are appended as `pi-claude-auth-compaction-fallback`
+  custom entries; read them (and `server_compaction_*` debug events) first
+  when a session used Pi's summary.
 - Transport headers: `user-agent: claude-cli/<ver> (external, sdk-cli)`,
   `x-app: cli`, `x-claude-code-session-id`, per-request `x-client-request-id`,
   `x-claude-code-prompt-id` (mirrors cc_prompt_id),

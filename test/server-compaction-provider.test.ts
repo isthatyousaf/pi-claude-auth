@@ -51,13 +51,13 @@ function sse(events: unknown[]): Response {
 	return new Response(text, { status: 200, headers: { "content-type": "text/event-stream" } });
 }
 
-function compactionResponse(content: string): Response {
+function compactionResponse(content: string, extra: Record<string, unknown> = {}): Response {
 	return sse([
 		{
 			type: "message_start",
 			message: { id: "msg_c", type: "message", role: "assistant", model: "claude-haiku-5-5", content: [], stop_reason: null, usage: { input_tokens: 0, output_tokens: 0 } },
 		},
-		{ type: "content_block_start", index: 0, content_block: { type: "compaction", content, signature: "sig-" + content } },
+		{ type: "content_block_start", index: 0, content_block: { type: "compaction", content, signature: "sig-" + content, ...extra } },
 		{ type: "content_block_stop", index: 0 },
 		{
 			type: "message_delta",
@@ -120,6 +120,10 @@ describe("server compaction through the provider", () => {
 	let handlers: Record<string, Handler[]>;
 	let compactions: number;
 	let compactionGate: Promise<void> | undefined;
+	let blockExtra: Record<string, unknown>;
+	let appended: Array<{ customType: string; data: Record<string, unknown> }>;
+	let apiKey: string;
+	let betaHeaders: string[];
 
 	beforeEach(async () => {
 		dir = mkdtempSync(join(tmpdir(), "pi-claude-auth-compaction-"));
@@ -130,12 +134,17 @@ describe("server compaction through the provider", () => {
 		bodies = [];
 		compactions = 0;
 		compactionGate = undefined;
+		blockExtra = {};
+		appended = [];
+		apiKey = OAUTH_TOKEN;
+		betaHeaders = [];
 		globalThis.fetch = (async (_input: unknown, init?: RequestInit) => {
 			const body = JSON.parse(String(init?.body));
 			bodies.push(body);
+			betaHeaders.push(new Headers(init?.headers).get("anthropic-beta") ?? "");
 			if (body.compaction) {
 				await compactionGate;
-				return compactionResponse("Summary " + ++compactions);
+				return compactionResponse("Summary " + ++compactions, blockExtra);
 			}
 			return new Response(JSON.stringify({ type: "error", error: { type: "api_error", message: "stub" } }), {
 				status: 500,
@@ -161,6 +170,9 @@ describe("server compaction through the provider", () => {
 			},
 			registerCommand() {},
 			getCommands: () => [],
+			appendEntry(customType: string, data: Record<string, unknown>) {
+				appended.push({ customType, data });
+			},
 		} as unknown as ExtensionAPI);
 		const found = runtime.getModels("anthropic").find((m) => m.id === "claude-haiku-5-5");
 		if (!found) throw new Error("claude-haiku-5-5 missing from the catalog");
@@ -190,7 +202,7 @@ describe("server compaction through the provider", () => {
 				buildSessionProjection: () => buildSessionProjection(branch),
 			},
 			modelRegistry: {
-				getApiKeyAndHeaders: async () => ({ ok: true, apiKey: OAUTH_TOKEN }),
+				getApiKeyAndHeaders: async () => ({ ok: true, apiKey }),
 				streamSimple: runtime.streamSimple.bind(runtime),
 			},
 		};
@@ -200,7 +212,7 @@ describe("server compaction through the provider", () => {
 	async function agentRequest(messages: Message[], reasoning = "high"): Promise<Body> {
 		const before = bodies.length;
 		const stream = runtime.streamSimple(model, { messages }, {
-			apiKey: OAUTH_TOKEN,
+			apiKey,
 			sessionId: SESSION,
 			maxRetries: 0,
 			reasoning,
@@ -279,7 +291,12 @@ describe("server compaction through the provider", () => {
 	const stripCache = (value: unknown) =>
 		JSON.parse(JSON.stringify(value, (key, v) => (key === "cache_control" ? undefined : v)));
 
-	function appendCompaction(branch: SessionEntry[], result: NonNullable<Awaited<ReturnType<typeof compact>>>, id: string) {
+	function appendCompaction(
+		branch: SessionEntry[],
+		result: NonNullable<Awaited<ReturnType<typeof compact>>>,
+		id: string,
+		systemMessage: Record<string, unknown> = snapshot(),
+	) {
 		const [entry] = chain({
 			type: "compaction",
 			id,
@@ -288,7 +305,7 @@ describe("server compaction through the provider", () => {
 			tokensBefore: 100,
 			fromHook: true,
 			details: result.compaction.details,
-			systemMessage: snapshot(),
+			systemMessage,
 		});
 		(entry as { parentId: string }).parentId = branch.at(-1)?.id as string;
 		return [...branch, entry];
@@ -321,13 +338,113 @@ describe("server compaction through the provider", () => {
 		expect(compactionBodies()).toHaveLength(0);
 	});
 
-	it("falls back when tools changed during the session [finding 2]", async () => {
+	it("carries tools added in the summarized part through the block's tool_changes [fallbacks: tools]", async () => {
 		const change = { type: "message", id: "tc", message: { role: "system", content: "", toolsAdded: [tool("two")], timestamp: clock++ } };
 		const branch = chain(sys("s", [tool("one")]), user("u1"), assistant("a1"), change, user("u2"), assistant("a2"), user("u3"));
 		const agentBody = await agentRequest(await sessionRequest(branch));
 		expect(JSON.stringify(agentBody.messages)).toContain("tool_addition");
+		blockExtra = { tool_changes: [{ type: "tool_addition", name: "two" }] };
+
+		const result = await compact(branch, "u3");
+		expect(result?.compaction.summary).toBe("Summary 1");
+		const [compactionBody] = compactionBodies();
+		expect(betaHeaders[bodies.indexOf(compactionBody)]).toContain("inline-tools-2026-09-15");
+		const details = result?.compaction.details as unknown as Record<string, unknown[]>;
+		expect(details.requestTools.map((t) => (t as { name: string }).name)).toEqual(toolNames(agentBody));
+		expect(details.effectiveTools.map((t) => (t as { name: string }).name)).toEqual(["one", "two"]);
+
+		// Pi's compaction declares both tools up front; the block brings "two" back by itself.
+		const after = appendCompaction(branch, result as never, "c1", {
+			role: "system", content: SYSTEM_TEXT, toolsAdded: [tool("one"), tool("two")], timestamp: clock++,
+		});
+		const next = await agentRequest(await sessionRequest(after));
+		expect(betaHeaders.at(-1)).toContain("inline-tools-2026-09-15");
+		expect(toolNames(next)).not.toContain("two");
+		expect(next.messages[0]).toMatchObject({ role: "assistant", content: [{ type: "compaction", tool_changes: blockExtra.tool_changes }] });
+		expect(stripCache(next.tools)).toEqual(stripCache(compactionBody.tools));
+	});
+
+	it("keeps Pi's tools when the block recorded no tool changes [fallbacks: tools]", async () => {
+		const change = { type: "message", id: "tc", message: { role: "system", content: "", toolsAdded: [tool("two")], timestamp: clock++ } };
+		const branch = chain(sys("s", [tool("one")]), user("u1"), assistant("a1"), change, user("u2"), assistant("a2"), user("u3"));
+		await agentRequest(await sessionRequest(branch));
+		const result = await compact(branch, "u3");
+		expect(result?.compaction.details).not.toHaveProperty("requestTools");
+		const after = appendCompaction(branch, result as never, "c1", {
+			role: "system", content: SYSTEM_TEXT, toolsAdded: [tool("one"), tool("two")], timestamp: clock++,
+		});
+		const next = await agentRequest(await sessionRequest(after));
+		expect(toolNames(next)).toContain("two");
+	});
+
+	it("sends Pi's tools as they are when they differ from what the compaction request ended with [fallbacks: tools]", async () => {
+		const change = { type: "message", id: "tc", message: { role: "system", content: "", toolsAdded: [tool("two")], timestamp: clock++ } };
+		const branch = chain(sys("s", [tool("one")]), user("u1"), assistant("a1"), change, user("u2"), assistant("a2"), user("u3"));
+		await agentRequest(await sessionRequest(branch));
+		blockExtra = { tool_changes: [{ type: "tool_addition", name: "two" }] };
+		const result = await compact(branch, "u3");
+		const after = appendCompaction(branch, result as never, "c1", {
+			role: "system", content: SYSTEM_TEXT, toolsAdded: [tool("one"), tool("three")], timestamp: clock++,
+		});
+		const next = await agentRequest(await sessionRequest(after));
+		expect(toolNames(next)).toContain("three");
+	});
+
+	it("falls back when tools changed and pi-ai declares them up front [finding 2]", async () => {
+		const change = { type: "message", id: "tc", message: { role: "system", content: "", toolsAdded: [tool("two")], timestamp: clock++ } };
+		// Without tools on the first system message, pi-ai declares the current tools up front.
+		const branch = chain(sys("s", []), user("u1"), assistant("a1"), change, user("u2"), assistant("a2"), user("u3"));
+		const agentBody = await agentRequest(await sessionRequest(branch));
+		expect(JSON.stringify(agentBody.messages)).not.toContain("tool_addition");
 		expect(await compact(branch, "u3")).toBeUndefined();
 		expect(compactionBodies()).toHaveLength(0);
+		expect(appended[0]).toMatchObject({ customType: "pi-claude-auth-compaction-fallback", data: { reason: "tools changed during the session" } });
+	});
+
+	it("moves the cut past a prompt-section update that would land among the kept turns [fallbacks: prompt]", async () => {
+		const update = { type: "message", id: "su", message: { role: "system", content: "", sections: { rules: "New rule." }, timestamp: clock++ } };
+		const branch = chain(
+			sys("s"), user("u1"), assistant("a1"), user("u2"), assistant("a2"), update, user("u3"), assistant("a3"), user("u4"), assistant("a4"), user("u5"),
+		);
+		await agentRequest(await sessionRequest(branch));
+		const result = await compact(branch, "u2");
+		expect(result?.compaction.firstKeptEntryId).toBe("a3");
+		const [compactionBody] = compactionBodies();
+		expect(JSON.stringify(compactionBody.messages)).toContain("New rule.");
+		expect(JSON.stringify(compactionBody.messages)).toContain("prompt u3");
+		expect(JSON.stringify(compactionBody.messages)).not.toContain("reply a3");
+	});
+
+	it("falls back when no cut after a prompt-section update remains [fallbacks: prompt]", async () => {
+		const update = { type: "message", id: "su", message: { role: "system", content: "", sections: { rules: "New rule." }, timestamp: clock++ } };
+		const branch = chain(sys("s"), user("u1"), assistant("a1"), user("u2"), assistant("a2"), user("u3"), update);
+		await agentRequest(await sessionRequest(branch));
+		expect(await compact(branch, "u2")).toBeUndefined();
+		expect(compactionBodies()).toHaveLength(0);
+		expect(appended[0].data.reason).toBe("no cut after the last system prompt or tool change");
+	});
+
+	it("compacts on the server with an API key and keeps the compaction request's system [fallbacks: auth]", async () => {
+		apiKey = "sk-ant-api03-test-key";
+		const update = { type: "message", id: "su", message: { role: "system", content: "", sections: { rules: "New rule." }, timestamp: clock++ } };
+		const branch = chain(sys("s"), user("u1"), assistant("a1"), user("u2"), update, assistant("a2"), user("u3"));
+		const agentBody = await agentRequest(await sessionRequest(branch));
+		expect(JSON.stringify(agentBody.system)).toContain(SYSTEM_TEXT);
+		const result = await compact(branch, "a2");
+		expect(result?.compaction.summary).toBe("Summary 1");
+		const [compactionBody] = compactionBodies();
+		expect(compactionBody.system).toEqual(agentBody.system);
+		expect(result?.compaction.details).toMatchObject({ requestAuth: "api-key", requestSystem: compactionBody.system });
+
+		// Pi's compaction folds the update into the leading system message.
+		const after = appendCompaction(branch, result as never, "c1", {
+			role: "system", content: SYSTEM_TEXT + " Updated.", toolsAdded: [tool("read"), tool("codemode")], timestamp: clock++,
+		});
+		const next = await agentRequest(await sessionRequest(after));
+		expect(stripCache(next.system)).toEqual(stripCache(compactionBody.system));
+		expect(next.messages[0]).toMatchObject({ role: "assistant", content: [{ type: "compaction" }] });
+		expect(JSON.stringify(next.messages)).toContain("Updated.");
+		expect(JSON.stringify(next.messages)).not.toContain(ANCHOR_TEXT);
 	});
 
 	it("falls back when the cut separates two user messages [finding 3]", async () => {
@@ -457,7 +574,7 @@ describe("server compaction through the provider", () => {
 		expect(lastAgentRequest("another-session")).toBeUndefined();
 	});
 
-	it("forgets the record when a request goes to another model or auth, or the model changes [round 3, finding 1]", async () => {
+	it("forgets the record when a request goes to another model, or the model changes [round 3, finding 1]", async () => {
 		const branch = chain(sys("s", [tool("one")]), user("u1"), assistant("a1"), user("u2"), assistant("a2"), user("u3"));
 		const older = runtime.getModels("anthropic").find((m) => m.id === "claude-haiku-4-5");
 		if (!older) throw new Error("claude-haiku-4-5 missing from the catalog");
@@ -469,9 +586,12 @@ describe("server compaction through the provider", () => {
 		expect(await compact(branch, "u2")).toBeUndefined();
 		expect(compactionBodies()).toHaveLength(0);
 
+		// An API-key request replaces the record; compacting with OAuth then falls back.
 		await agentRequest(await sessionRequest(branch));
 		await send(model, { messages: await sessionRequest(branch) }, { apiKey: "sk-ant-api03-test-key" });
-		expect(lastAgentRequest(SESSION)).toBeUndefined();
+		expect(lastAgentRequest(SESSION)?.auth).toBe("api-key");
+		expect(await compact(branch, "u2")).toBeUndefined();
+		expect(compactionBodies()).toHaveLength(0);
 
 		await agentRequest(await sessionRequest(branch));
 		for (const handler of handlers.model_select ?? []) await handler({ type: "model_select", model: older }, ctx(branch));

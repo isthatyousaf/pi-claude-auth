@@ -20,6 +20,7 @@ import {
 	payloadDeclarationsKey,
 	recordAgentRequest,
 	recordsAgentRequests,
+	type RequestAuth,
 	stripAnchors,
 	wireMessageRecords,
 } from "./server-compaction.ts";
@@ -55,40 +56,65 @@ function oneHourCacheEnabled(): boolean {
  * - Merges {@link claudeCodeHeaders} into `options.headers`.
  * - Wraps the transport with {@link createClaudeCodeFetch} so the `cch`
  *   placeholder is resolved against the final serialized body.
- * - Chains `onPayload`: runs any pre-existing transform first, then swaps in
- *   a server-compaction block ({@link applyServerCompactionPayload}), then
- *   applies {@link injectBillingHeader} (billing block + system relocation +
- *   device metadata) to the result, so other extensions' payload transforms
- *   compose correctly.
- * - Turns off Anthropic message threads for requests that carry a compaction
- *   block: the API rejects threads on them, and pi-ai would otherwise spend a
- *   rejected request finding that out.
- * - Records each agent request, which a server compaction request continues
- *   ({@link recordAgentRequest}), tied to the context hook state of that
- *   request ({@link claimAgentRequestContext}).
+ * - Chains `onPayload` ({@link mergeServerCompactionOptions}): runs any
+ *   pre-existing transform first, then the server-compaction rewrite, then
+ *   {@link injectBillingHeader} (billing block + system relocation + device
+ *   metadata), so other extensions' payload transforms compose correctly.
  *
- * Only applied to OAuth tokens (`sk-ant-oat`); plain API-key requests pass
- * through the built-in provider untouched and bill normally on their own.
+ * Only applied to OAuth tokens (`sk-ant-oat`); plain API-key requests bill
+ * normally on their own and get only {@link mergeServerCompactionOptions}.
  */
 function mergeClaudeCodeOptions<T extends StreamOptions>(
 	options: T,
 	device: DeviceIdentity | null,
 	context: Context,
 ): T {
-	const originalOnPayload = options.onPayload;
 	const transport = options.fetch ?? globalThis.fetch;
+	return {
+		...mergeServerCompactionOptions(options, context, "oauth", (current, systemTextPlacement) => {
+			const updated = injectBillingHeader(current, {
+				sessionId: options.sessionId,
+				device,
+				systemTextPlacement,
+			});
+			if (updated) log("billing_header_injected", {});
+			return updated;
+		}),
+		// Claude Code uses ENABLE_PROMPT_CACHING_1H to force ttl="1h". Pi's
+		// Anthropic provider maps cacheRetention="long" to the same wire shape.
+		...(oneHourCacheEnabled() ? { cacheRetention: "long" } : {}),
+		headers: { ...options.headers, ...claudeCodeHeaders(options.sessionId) },
+		fetch: createClaudeCodeFetch(transport),
+	} as T;
+}
+
+/**
+ * The server-compaction part of a request's options, shared by OAuth and
+ * API-key requests:
+ *
+ * - Records each agent request, which a server compaction request continues
+ *   ({@link recordAgentRequest}), tied to the context hook state of that
+ *   request ({@link claimAgentRequestContext}).
+ * - Swaps in a server-compaction block ({@link applyServerCompactionPayload});
+ *   OAuth requests then get the billing transform (`finish`).
+ * - Turns off Anthropic message threads for requests that carry a block.
+ *
+ * Other extensions' payload transforms run first.
+ */
+function mergeServerCompactionOptions<T extends StreamOptions>(
+	options: T,
+	context: Context,
+	auth: RequestAuth,
+	finish?: (current: unknown, systemTextPlacement: ReturnType<typeof applyServerCompactionPayload>) => unknown,
+): T {
+	const originalOnPayload = options.onPayload;
 	// Claimed before any await, so the hook state stays with this request.
 	const agentRequest = claimAgentRequestContext(context.messages);
 	return {
 		...options,
-		// Claude Code uses ENABLE_PROMPT_CACHING_1H to force ttl="1h". Pi's
-		// Anthropic provider maps cacheRetention="long" to the same wire shape.
-		...(oneHourCacheEnabled() ? { cacheRetention: "long" } : {}),
 		...(contextCarriesCompactionBlock(context.messages)
 			? { disableContinuation: true }
 			: {}),
-		headers: { ...options.headers, ...claudeCodeHeaders(options.sessionId) },
-		fetch: createClaudeCodeFetch(transport),
 		onPayload: async (payload, model) => {
 			const prior = await originalOnPayload?.(payload, model);
 			const current = prior ?? payload;
@@ -105,23 +131,18 @@ function mergeClaudeCodeOptions<T extends StreamOptions>(
 						wire: wireMessageRecords(current),
 						declarationsKey: payloadDeclarationsKey(current),
 						cacheRetention: options.cacheRetention,
+						auth,
 					},
 					options.signal?.aborted,
 				);
 			}
 			try {
-				const systemTextPlacement = applyServerCompactionPayload(current);
-				const updated = injectBillingHeader(current, {
-					sessionId: options.sessionId,
-					device,
-					systemTextPlacement,
-				});
-				if (updated) {
-					log("billing_header_injected", {});
-					return updated;
-				}
+				const systemTextPlacement = applyServerCompactionPayload(current, { auth });
+				const updated = finish?.(current, systemTextPlacement);
+				if (updated) return updated;
+				if (!finish) return current;
 			} catch (err) {
-				log("billing_header_error", {
+				log(finish ? "billing_header_error" : "server_compaction_payload_error", {
 					error: err instanceof Error ? err.message : String(err),
 				});
 			} finally {
@@ -174,8 +195,8 @@ function isApiShapedOptions(options?: SimpleStreamOptions): boolean {
  *
  * OAuth requests (`sk-ant-oat` tokens) get the Claude Code billing header,
  * identity headers, and a real `cch` body checksum merged into their options.
- * Non-OAuth (API-key) requests are delegated unchanged and bill normally on
- * their own.
+ * Non-OAuth (API-key) requests bill normally on their own; they get only the
+ * server-compaction options, for models that support it.
  */
 export interface AnthropicStreamOverlay {
 	api: Api;
@@ -215,13 +236,13 @@ export function createAnthropicStreamOverlay(
 			const delegate: StreamDelegate = isApiShapedOptions(options)
 				? (m, c, o) => base.stream(m, c, o as never)
 				: (m, c, o) => base.streamSimple(m, c, o);
-			if (!options || !isAnthropicOAuthToken(options.apiKey))
-				return delegate(model, context, options);
-			return delegate(
-				model,
-				context,
-				mergeClaudeCodeOptions(options, device, context),
-			);
+			if (!options) return delegate(model, context, options);
+			if (isAnthropicOAuthToken(options.apiKey))
+				return delegate(model, context, mergeClaudeCodeOptions(options, device, context));
+			// API-key requests bill on their own; they only get server compaction.
+			if (options.apiKey && recordsAgentRequests(model.id))
+				return delegate(model, context, mergeServerCompactionOptions(options, context, "api-key"));
+			return delegate(model, context, options);
 		},
 	};
 }

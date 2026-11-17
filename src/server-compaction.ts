@@ -19,7 +19,8 @@ import { isAnthropicOAuthToken } from "./cch.ts";
 import { log } from "./logger.ts";
 
 /**
- * Anthropic server-side on-demand compaction for subscription (OAuth) sessions.
+ * Anthropic server-side on-demand compaction for Anthropic sessions, with a
+ * subscription (OAuth) token or an API key.
  *
  * Pi's own compaction writes a text summary, and Anthropic rejects the thinking
  * in the turns kept after a summary it did not write (`thinking_dropped`,
@@ -28,11 +29,19 @@ import { log } from "./logger.ts";
  * compaction entry's `details`, and every later request sends the block in
  * place of Pi's summary message, so the kept thinking stays valid.
  *
- * Pi's system prompt has to leave `system[]` for plan billing (see
- * transforms.ts), and the API rejects kept thinking when that text lands inside
- * a kept turn. After a server compaction the prompt therefore goes to an
- * anchor: a fixed point right after the kept turns of the compaction that
- * placed it, the same on every later request and after a resume.
+ * On OAuth requests Pi's system prompt has to leave `system[]` for plan
+ * billing (see transforms.ts), and the API rejects kept thinking when that
+ * text lands inside a kept turn. After a server compaction the prompt
+ * therefore goes to an anchor: a fixed point right after the kept turns of the
+ * compaction that placed it, the same on every later request and after a
+ * resume. API-key requests keep the compaction request's `system` and put a
+ * changed prompt at the anchor.
+ *
+ * Pi folds system messages into the leading one at its compaction, while the
+ * compaction request sent them inline. Prompt updates are therefore kept out
+ * of the kept turns (the cut moves past them), and tool changes are carried by
+ * the block's `tool_changes` while later requests repeat the compaction
+ * request's tools.
  *
  * The compaction request is the last agent request of the session, cut at the
  * first kept message. Pi's final request projection (hidden declarations, a
@@ -43,6 +52,12 @@ import { log } from "./logger.ts";
  */
 
 export const COMPACT_BETA = "compact-2026-09-04";
+/**
+ * With it on the compaction request the block records the tool changes of the
+ * summarized messages (`tool_changes`); every request that carries such a
+ * block must send it too.
+ */
+export const INLINE_TOOLS_BETA = "inline-tools-2026-09-15";
 
 /** Models the compaction docs list for on-demand compaction on the Claude API. */
 export const SERVER_COMPACTION_MODELS: ReadonlySet<string> = new Set([
@@ -81,12 +96,38 @@ export interface CompactionBlock {
 	[key: string]: unknown;
 }
 
+/** How a request authenticated: an OAuth subscription token or an API key. */
+export type RequestAuth = "oauth" | "api-key";
+
+/** The declarations a compaction request sent, which later requests send again. */
+export interface CompactionDeclarations {
+	requestAuth?: RequestAuth;
+	/** Request-level `tools` of the compaction request. */
+	requestTools?: unknown[];
+	/**
+	 * Tools in effect at the end of the compaction request: `requestTools` and
+	 * the changes inside the summarized messages, which the block records in
+	 * `tool_changes`. Pi declares these up front after its compaction.
+	 */
+	effectiveTools?: unknown[];
+	/** `system` of an API-key compaction request. */
+	requestSystem?: unknown;
+}
+
 /** `details` of a compaction entry written by this extension. */
-export interface ServerCompactionDetails {
+export interface ServerCompactionDetails extends CompactionDeclarations {
 	anthropicCompaction: CompactionBlock;
 	readFiles: string[];
 	modifiedFiles: string[];
 }
+
+/** customType of the session entry that records why Pi's summary was used. */
+export const FALLBACK_ENTRY_TYPE = "pi-claude-auth-compaction-fallback";
+
+/** The `buildCompactionRequestMessages` reason that moving the cut forward can fix. */
+export const KEPT_SYSTEM_CHANGE = "a system prompt or tool change lies in the kept turns";
+
+const DEFERRED_TOOL_PLACEHOLDER_NAME = "__pi_deferred_placeholder__";
 
 /** Kill switch: `PI_CLAUDE_AUTH_SERVER_COMPACTION=0` restores Pi's own compaction. */
 export function serverCompactionEnabled(): boolean {
@@ -131,20 +172,34 @@ export function summaryMessageText(summary: string): string {
 		.join("");
 }
 
-// Keyed by the wire text of the summary message the block replaces. Blocks are
-// small and the text identifies its block exactly, so entries from any session
-// in this process can share the map.
-const blocksBySummaryText = new Map<string, CompactionBlock>();
+interface KnownCompaction extends CompactionDeclarations {
+	block: CompactionBlock;
+}
 
-export function rememberCompactionBlock(summary: string, block: CompactionBlock): void {
-	blocksBySummaryText.set(summaryMessageText(summary), block);
+// Keyed by the wire text of the summary message the block replaces. The text
+// identifies its block exactly, so entries from any session in this process
+// can share the map.
+const blocksBySummaryText = new Map<string, KnownCompaction>();
+
+export function rememberCompactionBlock(
+	summary: string,
+	block: CompactionBlock,
+	declarations: CompactionDeclarations = {},
+): void {
+	blocksBySummaryText.set(summaryMessageText(summary), { ...declarations, block });
 }
 
 export function rememberCompactionBlocks(entries: readonly SessionEntry[]): void {
 	for (const entry of entries) {
 		const block = blockFromEntry(entry);
-		if (block && entry.type === "compaction")
-			rememberCompactionBlock(entry.summary, block);
+		if (!block || entry.type !== "compaction") continue;
+		const details = entry.details as Partial<ServerCompactionDetails>;
+		rememberCompactionBlock(entry.summary, block, {
+			requestAuth: details.requestAuth,
+			requestTools: details.requestTools,
+			effectiveTools: details.effectiveTools,
+			requestSystem: details.requestSystem,
+		});
 	}
 }
 
@@ -242,26 +297,188 @@ function addBeta(payload: WirePayload, beta: string): void {
 // extension's onPayload and reaches the overlay's transform unchanged, and a
 // marker field would have to be removed before serialization.
 const compactionRequestPayloads = new WeakSet<object>();
+// The declarations each compaction request sent, taken after the overlay's
+// rewrite and read back once the block arrives.
+const compactionRequestDeclarations = new WeakMap<object, CompactionDeclarations>();
 
 export function markCompactionRequestPayload(payload: object): void {
 	compactionRequestPayloads.add(payload);
 }
 
+export function compactionDeclarationsOf(payload: object): CompactionDeclarations | undefined {
+	return compactionRequestDeclarations.get(payload);
+}
+
+function withoutCacheControlValue<T>(value: T): T {
+	return JSON.parse(JSON.stringify(value, withoutCacheControl)) as T;
+}
+
+type WireTool = { name?: unknown } & Record<string, unknown>;
+
+/** Tools compared as a set: by name, without cache breakpoints or pi-ai's placeholder. */
+export function toolsKey(tools: unknown): string {
+	if (!Array.isArray(tools)) return "null";
+	const list = (tools as WireTool[])
+		.filter((tool) => tool?.name !== DEFERRED_TOOL_PLACEHOLDER_NAME)
+		.map((tool) => JSON.stringify(tool, withoutCacheControl))
+		.sort();
+	return JSON.stringify(list);
+}
+
 /**
- * Rewrite one OAuth payload for server compaction, before the billing
- * transform runs. Returns where the billing transform must put the system text.
+ * `tools` with the `tool_addition` and `tool_removal` blocks of `messages`
+ * applied in order, the way the API applies them.
+ */
+export function applyInlineToolChanges(tools: readonly unknown[], messages: unknown): unknown[] {
+	const byName = new Map<string, unknown>();
+	for (const tool of tools as WireTool[]) {
+		if (tool?.name !== DEFERRED_TOOL_PLACEHOLDER_NAME)
+			byName.set(String(tool?.name), withoutCacheControlValue(tool));
+	}
+	if (Array.isArray(messages)) {
+		for (const message of messages as WireMessage[]) {
+			if (message?.role !== "system" || !Array.isArray(message.content)) continue;
+			for (const block of message.content) {
+				const tool = block.tool as { name?: unknown; definition?: WireTool } | undefined;
+				if (block.type === "tool_removal" && tool?.name !== undefined) byName.delete(String(tool.name));
+				if (block.type === "tool_addition" && tool?.definition?.name !== undefined)
+					byName.set(String(tool.definition.name), withoutCacheControlValue(tool.definition));
+			}
+		}
+	}
+	return [...byName.values()];
+}
+
+function hasRecordedToolChanges(block: CompactionBlock): boolean {
+	const changes = block.tool_changes;
+	return Array.isArray(changes) ? changes.length > 0 : changes !== undefined && changes !== null;
+}
+
+/**
+ * After Pi's compaction the leading system message declares every tool, the
+ * ones added since the start included. The block records those additions
+ * itself and the API applies them, so the request-level tools must stay those
+ * of the compaction request. Restored only when Pi's tools are exactly what
+ * that request ended with; otherwise the request goes out as Pi built it.
+ * Returns whether `tools` now equal the compaction request's.
+ */
+function restoreCompactionTools(p: WirePayload, known: KnownCompaction): boolean {
+	if (!known.requestTools || !known.effectiveTools || !Array.isArray(p.tools)) return false;
+	const current = toolsKey(p.tools);
+	if (current === toolsKey(known.requestTools)) return true;
+	if (current !== toolsKey(known.effectiveTools)) {
+		log("server_compaction_tools_differ", {});
+		return false;
+	}
+	p.tools = structuredClone(known.requestTools);
+	return true;
+}
+
+function systemText(system: unknown): string {
+	if (typeof system === "string") return system;
+	if (!Array.isArray(system)) return "";
+	return (system as WireBlock[])
+		.map((block) => (block?.type === "text" ? (block.text ?? "") : ""))
+		.filter((text) => text.length > 0)
+		.join("\n\n");
+}
+
+/** Text an API-key request puts at the anchor when the system prompt changed. */
+export function systemPromptUpdateText(text: string): string {
+	return `The system prompt changed after the conversation above was summarized. The current system prompt follows; where it differs from the one at the start, follow this one.\n\n<system-prompt>\n${text}\n</system-prompt>`;
+}
+
+function findAnchorBlock(messages: unknown): { content: WireBlock[]; index: number } | undefined {
+	if (!Array.isArray(messages)) return undefined;
+	for (const message of messages as WireMessage[]) {
+		if (!Array.isArray(message?.content)) continue;
+		const index = message.content.findIndex(isAnchorBlock);
+		if (index >= 0) return { content: message.content, index };
+	}
+	return undefined;
+}
+
+/**
+ * API-key requests keep Pi's prompt in `system`, and Pi rewrites it at its
+ * compaction with every section update made before. The kept thinking needs
+ * the `system` of the compaction request, so that one is sent again, and a
+ * changed prompt goes to the anchor, after the kept turns. Without an anchor
+ * an agent request keeps Pi's `system`.
+ */
+function placeSystemForApiKey(
+	p: WirePayload,
+	known: KnownCompaction,
+	compactionRequest: boolean,
+): void {
+	if (known.requestAuth !== "api-key" || known.requestSystem === undefined) return;
+	const current = JSON.stringify(p.system ?? null, withoutCacheControl);
+	if (current === JSON.stringify(known.requestSystem, withoutCacheControl)) return;
+	const anchor = findAnchorBlock(p.messages);
+	if (!anchor && !compactionRequest) {
+		log("server_compaction_system_changed_without_anchor", {});
+		return;
+	}
+	const text = systemText(p.system);
+	p.system = structuredClone(known.requestSystem);
+	if (anchor && text.length > 0) {
+		const cacheControl = anchor.content[anchor.index].cache_control;
+		anchor.content[anchor.index] = {
+			type: "text",
+			text: systemPromptUpdateText(text),
+			...(cacheControl !== undefined ? { cache_control: cacheControl } : {}),
+		};
+	}
+}
+
+/**
+ * Remember what a compaction request declared, after this transform. The
+ * effective tools start from the tools the request declares, or, when it
+ * carries an earlier block with recorded tool changes, from the tools that
+ * block ended with.
+ */
+function stashCompactionDeclarations(
+	p: WirePayload,
+	known: KnownCompaction | undefined,
+	toolsRestored: boolean,
+	auth: RequestAuth | undefined,
+): void {
+	const requestTools = Array.isArray(p.tools) ? (structuredClone(p.tools) as unknown[]) : undefined;
+	let start: readonly unknown[] | undefined;
+	if (!known || !hasRecordedToolChanges(known.block)) start = requestTools;
+	else if (toolsRestored) start = known.effectiveTools;
+	compactionRequestDeclarations.set(p, {
+		...(auth ? { requestAuth: auth } : {}),
+		...(requestTools ? { requestTools } : {}),
+		...(start ? { effectiveTools: applyInlineToolChanges(start, p.messages) } : {}),
+		...(auth === "api-key" && p.system !== undefined
+			? { requestSystem: structuredClone(p.system) }
+			: {}),
+	});
+}
+
+/**
+ * Rewrite one payload for server compaction. For OAuth requests this runs
+ * before the billing transform and returns where that transform must put the
+ * system text; API-key requests keep their prompt in `system` and are
+ * finished here.
  *
  * - Pi's summary message at the start becomes the signed block. When the kept
  *   turns start with an assistant message (Pi cut inside a turn), the effort
  *   marker pi-ai put before it is dropped: the API forbids a `system` message
  *   as the first kept message.
- * - With a block, the system text goes to the anchor. A compaction request
- *   without an anchor drops it: adding the text to a summarized message would
- *   change the prefix the kept thinking was produced with.
+ * - The request-level tools of the compaction request are sent again
+ *   ({@link restoreCompactionTools}).
+ * - With a block, the OAuth system text goes to the anchor. A compaction
+ *   request without an anchor drops it: adding the text to a summarized
+ *   message would change the prefix the kept thinking was produced with.
+ *   API-key requests: {@link placeSystemForApiKey}.
  * - Without a block, anchors are removed and the system text goes to the first
  *   user message, as before.
  */
-export function applyServerCompactionPayload(payload: unknown): SystemTextPlacement {
+export function applyServerCompactionPayload(
+	payload: unknown,
+	options: { auth?: RequestAuth } = {},
+): SystemTextPlacement {
 	if (!payload || typeof payload !== "object") return "first-user";
 	const p = payload as WirePayload;
 	const messages = p.messages as WireMessage[] | undefined;
@@ -270,13 +487,17 @@ export function applyServerCompactionPayload(payload: unknown): SystemTextPlacem
 
 	const first = messages[0];
 	const summaryText = first?.role === "user" ? messageText(first) : undefined;
-	const block =
+	const known =
 		serverCompactionEnabled() && supportsServerCompaction(p.model) && summaryText !== undefined
 			? blocksBySummaryText.get(summaryText)
 			: undefined;
-	if (!block) {
+	if (!known) {
 		stripAnchors(p);
-		if (compactionRequest) addBeta(p, COMPACT_BETA);
+		if (compactionRequest) {
+			addBeta(p, COMPACT_BETA);
+			addBeta(p, INLINE_TOOLS_BETA);
+			stashCompactionDeclarations(p, undefined, false, options.auth);
+		}
 		return "first-user";
 	}
 
@@ -285,12 +506,16 @@ export function applyServerCompactionPayload(payload: unknown): SystemTextPlacem
 	messages[0] = {
 		role: "assistant",
 		content: [
-			cacheControl === undefined ? { ...block } : { ...block, cache_control: cacheControl },
+			cacheControl === undefined
+				? { ...known.block }
+				: { ...known.block, cache_control: cacheControl },
 		],
 	};
 	if (isEffortMarker(messages[1]) && messages[2]?.role === "assistant")
 		messages.splice(1, 1);
 	addBeta(p, COMPACT_BETA);
+	if (compactionRequest || hasRecordedToolChanges(known.block)) addBeta(p, INLINE_TOOLS_BETA);
+	const toolsRestored = restoreCompactionTools(p, known);
 
 	const anchors: Array<{ message: number; block: number }> = [];
 	messages.forEach((message, i) => {
@@ -299,16 +524,21 @@ export function applyServerCompactionPayload(payload: unknown): SystemTextPlacem
 			if (isAnchorBlock(b)) anchors.push({ message: i, block: j });
 		});
 	});
-	if (anchors.length === 0) return compactionRequest ? "drop" : "first-user";
-	if (anchors.length > 1) {
+	let placement: SystemTextPlacement;
+	if (anchors.length === 0) placement = compactionRequest ? "drop" : "first-user";
+	else if (anchors.length > 1) {
 		// More than one anchor means the context hook misplaced one; none of
 		// them can be trusted to match earlier requests.
 		stripAnchors(p);
 		log("server_compaction_anchor_ambiguous", { count: anchors.length });
-		return compactionRequest ? "drop" : "first-user";
+		placement = compactionRequest ? "drop" : "first-user";
+	} else {
+		moveAnchorPastToolResults(messages, anchors[0].message);
+		placement = "anchor";
 	}
-	moveAnchorPastToolResults(messages, anchors[0].message);
-	return "anchor";
+	if (options.auth === "api-key") placeSystemForApiKey(p, known, compactionRequest);
+	if (compactionRequest) stashCompactionDeclarations(p, known, toolsRestored, options.auth);
+	return placement;
 }
 
 /**
@@ -349,6 +579,8 @@ export interface AgentRequestRecord {
 	/** The session's {@link canonicalMessages} when the request was built. */
 	canonical?: readonly Message[];
 	cacheRetention?: unknown;
+	/** OAuth and API-key requests place the system prompt differently. */
+	auth?: RequestAuth;
 }
 
 // Pi emits before_provider_request only for agent requests. Its handler marks
@@ -831,11 +1063,14 @@ export type CompactionRequestMessages =
  *   than an anchor lie at the cut;
  * - the cut separates two messages of the same wire role, which earlier
  *   requests sent as one turn;
- * - tools changed during the session: Pi's compaction entry declares the
- *   current tools up front, while the compaction request declared the
- *   original tools and the changes inline;
- * - a system message would reach the wire next to the kept turns: Pi drops
- *   system messages from the kept part.
+ * - tools changed during the session and pi-ai declared them up front rather
+ *   than inline (`nativeToolChanges` false);
+ * - a system message would reach the wire among the kept turns
+ *   ({@link KEPT_SYSTEM_CHANGE}): Pi drops system messages from the kept part
+ *   and declares their changes up front. pi-ai sends a later system message
+ *   right before the next assistant message, so one in the summarized part
+ *   lands among the kept turns unless that assistant message is summarized
+ *   too or is the first kept message.
  *
  * An anchor at the cut joins the side it shares a wire role with: the
  * summarized side after a user message, else the kept side, where
@@ -851,6 +1086,8 @@ export function buildCompactionRequestMessages(options: {
 	firstKeptEntryId: string;
 	model: string;
 	provider: string;
+	/** Whether pi-ai declares tool changes inline (`tool_addition` blocks) for this request. */
+	nativeToolChanges?: boolean;
 }): CompactionRequestMessages {
 	const { request, projection, model } = options;
 	const fail = (reason: string): CompactionRequestMessages => ({ ok: false, reason });
@@ -879,7 +1116,9 @@ export function buildCompactionRequestMessages(options: {
 	const anchorOffset = between.findIndex(isAnchorMessage);
 	const anchorSummarized = anchorOffset >= 0 && lastRole === "user";
 	const anchorKept = anchorOffset >= 0 && !anchorSummarized;
-	const cutIndex = anchorSummarized ? lastIndex + anchorOffset + 2 : lastIndex + 1;
+	// System messages at the cut are summarized, as in Pi; an anchor that
+	// stays kept starts the kept part.
+	const cutIndex = anchorKept ? lastIndex + 1 + anchorOffset : end;
 	const nextRole = anchorKept ? "user" : firstKept ? wireRole(firstKept, model) : undefined;
 	if (nextRole === lastRole) return fail("the cut splits a turn");
 
@@ -897,13 +1136,16 @@ export function buildCompactionRequestMessages(options: {
 	)
 		return fail("the session changed since the last request");
 
+	const firstKeptAssistant = !anchorKept && firstKept?.role === "assistant" ? keptIndex : -1;
 	for (let i = 1; i < request.length; i++) {
 		const message = request[i];
-		if (changesTools(message)) return fail("tools changed during the session");
 		if (!changesSystem(message)) continue;
-		// pi-ai sends a later system message right before the next assistant message.
-		const next = request.findIndex((m, j) => j > i && m.role === "assistant");
-		if (next < 0 || next >= cutIndex) return fail("the system prompt changed in the kept turns");
+		if (changesTools(message) && !options.nativeToolChanges)
+			return fail("tools changed during the session");
+		if (i >= cutIndex) return fail(KEPT_SYSTEM_CHANGE);
+		const next = request.findIndex((m, j) => j > i && m.role === "assistant" && isSent(m));
+		if (next >= 0 && (next < cutIndex || next === firstKeptAssistant)) continue;
+		return fail(KEPT_SYSTEM_CHANGE);
 	}
 
 	const kept = (anchorKept ? undefined : firstKept) as
@@ -946,7 +1188,7 @@ function usageFromIteration(model: Model<Api>, iteration: CompactionIteration | 
 }
 
 export type CompactionOutcome =
-	| { ok: true; block: CompactionBlock; usage: Usage }
+	| { ok: true; block: CompactionBlock; usage: Usage; declarations?: CompactionDeclarations }
 	| { ok: false; reason: string; stopReason?: string };
 
 type StreamSimple = ExtensionContext["modelRegistry"]["streamSimple"];
@@ -978,6 +1220,7 @@ export async function requestServerCompaction(options: {
 	let stopReason: string | undefined;
 	let stopDetails: unknown;
 	let iteration: CompactionIteration | undefined;
+	let sentPayload: object | undefined;
 	const reasoning =
 		options.model.reasoning && options.reasoning && options.reasoning !== "off"
 			? options.reasoning
@@ -1014,6 +1257,7 @@ export async function requestServerCompaction(options: {
 				p.compaction = { type: "summarize", instructions: options.instructions };
 				addBeta(p, COMPACT_BETA);
 				markCompactionRequestPayload(p);
+				sentPayload = p;
 				return p;
 			},
 			onProviderStreamEvent: (event: unknown) => {
@@ -1043,7 +1287,13 @@ export async function requestServerCompaction(options: {
 			...(stopReason ? { stopReason } : {}),
 		};
 	}
-	return { ok: true, block, usage: usageFromIteration(options.model, iteration) };
+	const declarations = sentPayload ? compactionDeclarationsOf(sentPayload) : undefined;
+	return {
+		ok: true,
+		block,
+		usage: usageFromIteration(options.model, iteration),
+		...(declarations ? { declarations } : {}),
+	};
 }
 
 function eligibleModel(model: Model<Api> | undefined): model is Model<Api> {
@@ -1062,23 +1312,91 @@ function fileLists(fileOps: SessionBeforeCompactEvent["preparation"]["fileOps"])
 	};
 }
 
-async function compactOnServer(event: SessionBeforeCompactEvent, ctx: ExtensionContext) {
-	if (!serverCompactionEnabled()) return undefined;
-	const model = ctx.model;
-	if (!eligibleModel(model) || event.signal.aborted) return undefined;
-	const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
-	if (!auth.ok || !isAnthropicOAuthToken(auth.apiKey)) return undefined;
+/** Whether pi-ai declares tool changes inline for requests that start with `initial`. */
+function usesNativeToolChanges(model: Model<Api>, initial: Message | undefined): boolean {
+	const compat = (model as { compat?: unknown }).compat as
+		| { supportsMidConvoSystemMessages?: boolean; supportsMidConvoToolChanges?: boolean }
+		| undefined;
+	const tools = (initial as { role?: string; toolsAdded?: unknown[] } | undefined)?.toolsAdded;
+	return (
+		compat?.supportsMidConvoSystemMessages === true &&
+		compat.supportsMidConvoToolChanges === true &&
+		initial?.role === "system" &&
+		(tools?.length ?? 0) > 0
+	);
+}
 
+/**
+ * The first cut after the last system message of the session that the last
+ * request can be compacted at. Pi drops system messages from the kept part, so
+ * none may lie there. A tool result cannot start the kept part: its tool call
+ * would be summarized.
+ */
+export function moveCutPastSystemChanges(
+	projection: SessionProjection,
+	firstKeptEntryId: string,
+	build: (firstKeptEntryId: string) => CompactionRequestMessages,
+): { firstKeptEntryId: string; request: CompactionRequestMessages & { ok: true } } | undefined {
+	const start = projection.entries.findIndex((entry) => entry.sourceEntry.id === firstKeptEntryId);
+	if (start < 0) return undefined;
+	let lastChange = -1;
+	projection.entries.forEach((entry, i) => {
+		if ((entry.messages as Message[]).some(changesSystem)) lastChange = i;
+	});
+	for (let i = Math.max(start, lastChange) + 1; i < projection.entries.length; i++) {
+		const entry = projection.entries[i];
+		const first = (convertToLlm(entry.messages as never) as Message[]).find(isSent);
+		if (!first || first.role === "toolResult" || first.role === "system") continue;
+		const request = build(entry.sourceEntry.id);
+		if (request.ok) return { firstKeptEntryId: entry.sourceEntry.id, request };
+	}
+	return undefined;
+}
+
+type AppendEntry = (customType: string, data?: unknown) => void;
+
+async function compactOnServer(
+	event: SessionBeforeCompactEvent,
+	ctx: ExtensionContext,
+	appendEntry: AppendEntry,
+) {
+	const model = ctx.model;
+	if (model?.provider !== "anthropic" || model.api !== "anthropic-messages") return undefined;
 	const { preparation } = event;
-	const fallback = (reason: string) => {
-		log("server_compaction_fallback", { reason });
-		if (ctx.hasUI && reason !== "aborted")
+	const record = (reason: string, extra: Record<string, unknown> = {}) => {
+		log("server_compaction_fallback", { reason, ...extra });
+		try {
+			appendEntry(FALLBACK_ENTRY_TYPE, {
+				reason,
+				model: model.id,
+				trigger: (event as { reason?: unknown }).reason,
+				firstKeptEntryId: preparation.firstKeptEntryId,
+				tokensBefore: preparation.tokensBefore,
+				...extra,
+			});
+		} catch (err) {
+			log("server_compaction_fallback_entry_error", {
+				error: err instanceof Error ? err.message : String(err),
+			});
+		}
+		return undefined;
+	};
+	const fallback = (reason: string, extra: Record<string, unknown> = {}) => {
+		if (ctx.hasUI)
 			ctx.ui.notify(
 				`Anthropic compaction not used (${reason.slice(0, 200)}). Using Pi's summary instead.`,
 				"warning",
 			);
-		return undefined;
+		return record(reason, extra);
 	};
+
+	if (!serverCompactionEnabled()) return record("turned off by PI_CLAUDE_AUTH_SERVER_COMPACTION");
+	if (!supportsServerCompaction(model.id))
+		return record(`${model.id} does not support server compaction`);
+	if (event.signal.aborted) return record("aborted");
+	const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+	if (!auth.ok || !auth.apiKey) return fallback("no Anthropic credentials");
+	const requestAuth: RequestAuth = isAnthropicOAuthToken(auth.apiKey) ? "oauth" : "api-key";
 
 	const last = lastAgentRequest(ctx.sessionManager.getSessionId());
 	// The summary is only valid for the request it continues; anything that
@@ -1086,16 +1404,31 @@ async function compactOnServer(event: SessionBeforeCompactEvent, ctx: ExtensionC
 	const generation = agentRequestGeneration();
 	if (!last || last.modelId !== model.id)
 		return fallback(`no earlier request to ${model.id} in this session since Pi started`);
+	if (last.auth !== undefined && last.auth !== requestAuth)
+		return fallback("the credentials changed since the last request");
 	rememberCompactionBlocks(event.branchEntries);
-	const request = buildCompactionRequestMessages({
-		request: last.messages,
-		canonical: last.canonical,
-		projection: buildSessionProjection(event.branchEntries),
-		firstKeptEntryId: preparation.firstKeptEntryId,
-		model: model.id,
-		provider: model.provider,
-	});
+	const projection = buildSessionProjection(event.branchEntries);
+	const build = (firstKeptEntryId: string) =>
+		buildCompactionRequestMessages({
+			request: last.messages,
+			canonical: last.canonical,
+			projection,
+			firstKeptEntryId,
+			model: model.id,
+			provider: model.provider,
+			nativeToolChanges: usesNativeToolChanges(model, last.messages[0]),
+		});
+	let firstKeptEntryId = preparation.firstKeptEntryId;
+	let request = build(firstKeptEntryId);
+	if (!request.ok && request.reason === KEPT_SYSTEM_CHANGE) {
+		const moved = moveCutPastSystemChanges(projection, firstKeptEntryId, build);
+		if (!moved) return fallback("no cut after the last system prompt or tool change");
+		log("server_compaction_cut_moved", { from: firstKeptEntryId, to: moved.firstKeptEntryId });
+		firstKeptEntryId = moved.firstKeptEntryId;
+		request = moved.request;
+	}
 	if (!request.ok) return fallback(request.reason);
+	const { messages, keptAssistantEffort } = request;
 
 	const { readFiles, modifiedFiles } = fileLists(preparation.fileOps);
 	const attempt = async (instructions: string): Promise<CompactionOutcome> => {
@@ -1107,8 +1440,8 @@ async function compactOnServer(event: SessionBeforeCompactEvent, ctx: ExtensionC
 				headers: auth.headers as Record<string, string> | undefined,
 				sessionId: ctx.sessionManager.getSessionId(),
 				reasoning: ctx.thinkingLevel,
-				messages: request.messages,
-				keptAssistantEffort: request.keptAssistantEffort,
+				messages,
+				keptAssistantEffort,
 				instructions,
 				declarationsKey: last.declarationsKey,
 				recordedWire: last.wire,
@@ -1140,25 +1473,42 @@ async function compactOnServer(event: SessionBeforeCompactEvent, ctx: ExtensionC
 			buildCompactionInstructions({ customInstructions: event.customInstructions }),
 		);
 	}
-	if (!outcome.ok) return fallback(outcome.reason);
+	if (!outcome.ok) {
+		if (outcome.reason === "aborted") return record("aborted");
+		return fallback(outcome.reason, outcome.stopReason ? { stopReason: outcome.stopReason } : {});
+	}
 	if (agentRequestGeneration() !== generation)
 		return fallback("the session changed while Anthropic was compacting");
 
-	rememberCompactionBlock(outcome.block.content, outcome.block);
+	const declarations: CompactionDeclarations = { ...outcome.declarations, requestAuth };
+	// Without `tool_changes` the API applies no recorded change, so tools
+	// added in the summarized part stay declared up front, as Pi does.
+	if (
+		toolsKey(declarations.effectiveTools) !== toolsKey(declarations.requestTools) &&
+		!hasRecordedToolChanges(outcome.block)
+	) {
+		log("server_compaction_tool_changes_missing", {});
+		delete declarations.requestTools;
+		delete declarations.effectiveTools;
+	}
+	rememberCompactionBlock(outcome.block.content, outcome.block, declarations);
 	log("server_compaction", {
 		model: model.id,
+		auth: requestAuth,
 		splitTurn: preparation.isSplitTurn,
+		cutMoved: firstKeptEntryId !== preparation.firstKeptEntryId,
 		summaryChars: outcome.block.content.length,
 	});
 	const details: ServerCompactionDetails = {
 		anthropicCompaction: outcome.block,
 		readFiles,
 		modifiedFiles,
+		...declarations,
 	};
 	return {
 		compaction: {
 			summary: outcome.block.content,
-			firstKeptEntryId: preparation.firstKeptEntryId,
+			firstKeptEntryId,
 			tokensBefore: preparation.tokensBefore,
 			usage: outcome.usage,
 			details,
@@ -1167,10 +1517,9 @@ async function compactOnServer(event: SessionBeforeCompactEvent, ctx: ExtensionC
 }
 
 /**
- * Insert the anchor into an agent request after a server compaction. Only
- * OAuth requests to models that accept the block get it: the overlay replaces
- * it with the system text or strips it, and API-key requests bypass the
- * overlay's transforms.
+ * Insert the anchor into an agent request after a server compaction, for
+ * Anthropic requests to models that accept the block. The overlay replaces it
+ * with the system text or strips it.
  */
 async function anchorAgentRequest<T extends TimedMessage>(
 	messages: T[],
@@ -1184,7 +1533,7 @@ async function anchorAgentRequest<T extends TimedMessage>(
 	const anchorIndex = findAnchorIndex(branch, projection);
 	if (anchorIndex === undefined) return undefined;
 	const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
-	if (!auth.ok || !isAnthropicOAuthToken(auth.apiKey)) return undefined;
+	if (!auth.ok || !auth.apiKey) return undefined;
 	const anchored = insertAnchor(messages, projection, anchorIndex);
 	if (!anchored) log("server_compaction_anchor_missing", {});
 	return anchored;
@@ -1217,7 +1566,9 @@ export function registerServerCompaction(pi: ExtensionAPI): void {
 	});
 	pi.on("session_before_compact", async (event, ctx) => {
 		try {
-			return await compactOnServer(event, ctx);
+			return await compactOnServer(event, ctx, (customType, data) =>
+				pi.appendEntry(customType, data),
+			);
 		} catch (err) {
 			log("server_compaction_error", {
 				error: err instanceof Error ? err.message : String(err),

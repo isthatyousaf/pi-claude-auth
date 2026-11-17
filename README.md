@@ -79,17 +79,20 @@ The extension steps in once the refusal has fully arrived. A stream that hangs i
 
 ## Compaction
 
-On Claude models that support on-demand compaction (Claude 4.6 and newer, for example Haiku 5.5, Sonnet 5.5, Opus 5.5 and Fable 5.2), the extension has Anthropic write the summary when Pi compacts a subscription (OAuth) session, with `/compact` or automatically.
+On Claude models that support on-demand compaction (Claude 4.6 and newer, for example Haiku 5.5, Sonnet 5.5, Opus 5.5 and Fable 5.2), the extension has Anthropic write the summary when Pi compacts, with `/compact` or automatically. This works with a subscription (OAuth) login and with an API key.
 
 Pi's own summary is plain text that Anthropic did not write, so Anthropic discards the thinking in the turns Pi keeps after it. The session file shows this as `thinking_dropped` (`prefix_binding_mismatch`) in the `anthropic_input_transformations` diagnostics. Anthropic's summary comes as a signed `compaction` block. The extension saves the whole block in the compaction entry (`details.anthropicCompaction`) and sends it in place of Pi's summary on every later request, including after a resume, so the kept thinking stays valid.
 
 - The summary uses Pi's usual format and includes your `/compact` instructions. It shows in Pi as usual, and its cost appears in the compaction entry.
-- After a server summary, Pi's system prompt moves to a fixed point right after the kept turns instead of into your first message, because text added inside a kept turn would also discard its thinking.
+- After a server summary, Pi's system prompt moves to a fixed point right after the kept turns instead of into your first message, because text added inside a kept turn would also discard its thinking. With an API key the request keeps the system prompt the compaction request had; when Pi's prompt changed since, the new prompt goes to that fixed point.
+- Tools added or removed before the summary carry over: the compaction request asks Anthropic to record them in the block (`tool_changes`, beta `inline-tools-2026-09-15`), and later requests declare the tools that request declared. When Pi's tools then differ from what the block records, the request goes out with Pi's tools.
+- Pi's prompt updates (for example a changed `AGENTS.md` or a new tool's prompt line) must not land among the kept turns. When one would, the summary covers more: the kept part starts after the last update.
 - Requests that carry a compaction block do not use Anthropic's message threads, which reject them.
-- The compaction request repeats the last request Pi sent in this session, cut where Pi's summary ends, so it declares the same tools and prompt. Pi writes its own summary instead when that cannot be continued unchanged: right after Pi starts or resumes a session, before any request; after you switch models or move in `/tree`, until the next request; after tools changed during the session; or when Pi's cut falls inside a user turn or next to a system prompt update.
+- The compaction request repeats the last request Pi sent in this session, cut where Pi's summary ends, so it declares the same tools and prompt. Pi writes its own summary instead when that cannot be continued unchanged: right after Pi starts or resumes a session, before any request; after you switch models or move in `/tree`, until the next request; after a switch between subscription and API key, until the next request; when Pi's cut falls inside a user turn; or when no turn after the last prompt update can start the kept part.
 - If Anthropic does not return a block (an error, a refusal, or any other stop reason), you get a warning and Pi writes its own summary as before. A cancelled compaction stays cancelled.
+- Every time Pi writes its own summary instead, the session file gets a `custom` entry of type `pi-claude-auth-compaction-fallback` with the reason, the model, the stop reason if any, and the cut. The model never sees it.
 
-API-key logins, other models and other providers keep Pi's own compaction. Set `PI_CLAUDE_AUTH_SERVER_COMPACTION=0` to turn the feature off. Sessions compacted earlier then send Pi's text summary again.
+Other models and other providers keep Pi's own compaction. Set `PI_CLAUDE_AUTH_SERVER_COMPACTION=0` to turn the feature off. Sessions compacted earlier then send Pi's text summary again.
 
 ## Transport failures
 

@@ -13,14 +13,19 @@ import {
 	beginAgentRequest,
 	buildCompactionRequestMessages,
 	canonicalMessages,
+	applyInlineToolChanges,
 	COMPACT_BETA,
 	type CompactionBlock,
+	INLINE_TOOLS_BETA,
 	contextCarriesCompactionBlock,
+	FALLBACK_ENTRY_TYPE,
 	findAnchorIndex,
 	forgetAgentRequests,
 	forgetCompactionBlocks,
 	insertAnchor,
+	KEPT_SYSTEM_CHANGE,
 	markCompactionRequestPayload,
+	moveCutPastSystemChanges,
 	payloadDeclarationsKey,
 	recordAgentRequest,
 	registerServerCompaction,
@@ -28,6 +33,7 @@ import {
 	requestServerCompaction,
 	stripAnchors,
 	summaryMessageText,
+	toolsKey,
 	wireMessageRecords,
 	wirePrefixMismatch,
 } from "../src/server-compaction.ts";
@@ -109,7 +115,41 @@ describe("applyServerCompactionPayload", () => {
 		]);
 		expect(applyServerCompactionPayload(p)).toBe("anchor");
 		expect(p.messages[0]).toEqual({ role: "assistant", content: [BLOCK] });
+		// The block records tool changes, so the inline-tools beta goes with it.
+		expect(p.betas).toEqual(["oauth-2025-04-20", COMPACT_BETA, INLINE_TOOLS_BETA]);
+	});
+
+	it("adds only the compaction beta for a block without tool changes", () => {
+		const plain = { ...BLOCK, content: "plain", tool_changes: undefined };
+		rememberCompactionBlock(plain.content, plain);
+		const p = payload([{ role: "user", content: [{ type: "text", text: summaryMessageText("plain") }] }]);
+		applyServerCompactionPayload(p);
 		expect(p.betas).toEqual(["oauth-2025-04-20", COMPACT_BETA]);
+	});
+
+	it("restores the compaction request's tools only when Pi's tools are what that request ended with", () => {
+		const one = { name: "one", input_schema: {} };
+		const two = { name: "two", input_schema: {} };
+		const placeholder = { name: "__pi_deferred_placeholder__", defer_loading: true };
+		rememberCompactionBlock(BLOCK.content, BLOCK, { requestTools: [one, placeholder], effectiveTools: [one, two] });
+		const upFront = payload([summaryMessage()]);
+		upFront.tools = [{ ...one, cache_control: { type: "ephemeral" } }, two, placeholder];
+		applyServerCompactionPayload(upFront);
+		expect(upFront.tools).toEqual([one, placeholder]);
+		const other = payload([summaryMessage()]);
+		other.tools = [one, { name: "three", input_schema: {} }, placeholder];
+		applyServerCompactionPayload(other);
+		expect(other.tools).toEqual([one, { name: "three", input_schema: {} }, placeholder]);
+	});
+
+	it("applies inline tool changes in order", () => {
+		const def = (name: string) => ({ name, input_schema: {} });
+		const messages = [
+			{ role: "system", content: [{ type: "tool_addition", tool: { type: "tool_definition", definition: def("two") } }] },
+			{ role: "system", content: [{ type: "tool_removal", tool: { type: "tool_reference", name: "one" } }] },
+		];
+		expect(applyInlineToolChanges([def("one"), { name: "__pi_deferred_placeholder__" }], messages)).toEqual([def("two")]);
+		expect(toolsKey([def("a"), def("b")])).toBe(toolsKey([def("b"), { ...def("a"), cache_control: {} }]));
 	});
 
 	it("keeps the summary's cache breakpoint on the block", () => {
@@ -611,15 +651,57 @@ describe("buildCompactionRequestMessages", () => {
 		expect(build(branch, "u3")).toEqual({ ok: false, reason: "tools changed during the session" });
 	});
 
-	it("refuses when a system prompt update reaches the wire next to the kept turns", () => {
+	it("refuses when a system prompt update reaches the wire among the kept turns", () => {
 		const update = {
 			type: "message", id: "su",
 			message: { role: "system", content: "", sections: { b: "More." }, timestamp: clock++ },
 		};
 		const late = entries(sys("s"), user("u1"), assistant("a1"), user("u2"), update, assistant("a2"));
-		expect(build(late, "u2")).toEqual({ ok: false, reason: "the system prompt changed in the kept turns" });
+		expect(build(late, "u2")).toEqual({ ok: false, reason: KEPT_SYSTEM_CHANGE });
+		// Summarized, but pi-ai sends it right before a2, after the kept u2.
+		const held = entries(sys("s"), user("u1"), assistant("a1"), update, user("u2"), assistant("a2"));
+		expect(build(held, "u2")).toEqual({ ok: false, reason: KEPT_SYSTEM_CHANGE });
+		// Right before the first kept reply, it is the last summarized message on the wire.
+		expect(build(late, "a2")).toMatchObject({ ok: true });
 		const early = entries(sys("s"), user("u1"), update, assistant("a1"), user("u2"), assistant("a2"));
 		expect(build(early, "u2")).toMatchObject({ ok: true });
+	});
+
+	it("accepts tool changes in the summarized part only when pi-ai declares them inline", () => {
+		const change = {
+			type: "message", id: "tc",
+			message: { role: "system", content: "", toolsAdded: [{ name: "two", description: "", parameters: {} }], timestamp: clock++ },
+		};
+		const branch = entries(sys("s"), user("u1"), assistant("a1"), change, user("u2"), assistant("a2"), user("u3"));
+		expect(build(branch, "u3")).toEqual({ ok: false, reason: "tools changed during the session" });
+		const projection = buildSessionProjection(branch);
+		const native = buildCompactionRequestMessages({
+			request: agentRequest(branch),
+			canonical: canonicalMessages(projection.entries),
+			projection,
+			firstKeptEntryId: "u3",
+			model: "claude-haiku-5-5",
+			provider: "anthropic",
+			nativeToolChanges: true,
+		});
+		expect(native).toMatchObject({ ok: true });
+	});
+
+	it("moves the cut past the last system message of the kept turns", () => {
+		const update = {
+			type: "message", id: "su",
+			message: { role: "system", content: "", sections: { b: "More." }, timestamp: clock++ },
+		};
+		const branch = entries(
+			sys("s"), user("u1"), assistant("a1"), user("u2"), assistant("a2"), toolResult("t2", "a2"),
+			update, assistant("a3"), toolResult("t3", "a3"), assistant("a4"), user("u5"),
+		);
+		const projection = buildSessionProjection(branch);
+		const moved = moveCutPastSystemChanges(projection, "u2", (id) => build(branch, id));
+		expect(moved?.firstKeptEntryId).toBe("a3");
+		// Nothing after the update can start the kept part.
+		const tail = entries(sys("s"), user("u1"), assistant("a1"), user("u2"), assistant("a2"), toolResult("t2", "a2"), update);
+		expect(moveCutPastSystemChanges(buildSessionProjection(tail), "u2", (id) => build(tail, id))).toBeUndefined();
 	});
 
 	it("refuses when the last request does not hold the summarized messages", () => {
@@ -807,6 +889,10 @@ describe("requestServerCompaction", () => {
 
 describe("session_before_compact handler", () => {
 	type Handler = (event: unknown, ctx: unknown) => unknown;
+	let appended: Array<{ customType: string; data: Record<string, unknown> }> = [];
+	beforeEach(() => {
+		appended = [];
+	});
 	function handlers() {
 		const registered: Record<string, Handler[]> = {};
 		registerServerCompaction({
@@ -814,6 +900,7 @@ describe("session_before_compact handler", () => {
 				registered[name] ??= [];
 				registered[name].push(handler);
 			},
+			appendEntry: (customType: string, data: Record<string, unknown>) => appended.push({ customType, data }),
 		} as unknown as ExtensionAPI);
 		return registered;
 	}
@@ -886,14 +973,51 @@ describe("session_before_compact handler", () => {
 		expect(c.notices[0]).toContain("no earlier request to claude-haiku-5-5");
 	});
 
-	it("leaves compaction to Pi for API keys, other models, and the kill switch", async () => {
+	it("compacts on the server with an API key, and records its auth", async () => {
+		const r: FakeRun = { events: compactionEvents(), payloads: [], options: [] };
+		const result = (await handlers().session_before_compact[0](event(), ctx(r, "sk-ant-api03-x"))) as {
+			compaction: { details: Record<string, unknown> };
+		};
+		expect(result.compaction.details).toMatchObject({ anthropicCompaction: BLOCK, requestAuth: "api-key" });
+		expect(r.options[0]).toMatchObject({ apiKey: "sk-ant-api03-x" });
+	});
+
+	it("leaves compaction to Pi for other models and the kill switch, and records why", async () => {
 		const r: FakeRun = { events: compactionEvents(), payloads: [], options: [] };
 		const h = handlers().session_before_compact[0];
-		expect(await h(event(), ctx(r, "sk-ant-api03-x"))).toBeUndefined();
 		expect(await h(event(), ctx(r, "sk-ant-oat01-x", { ...MODEL, id: "claude-sonnet-4-5" }))).toBeUndefined();
 		expect(await h(event(), ctx(r, "sk-ant-oat01-x", { ...MODEL, provider: "openrouter" }))).toBeUndefined();
 		process.env.PI_CLAUDE_AUTH_SERVER_COMPACTION = "0";
 		expect(await h(event(), ctx(r))).toBeUndefined();
 		expect(r.payloads).toHaveLength(0);
+		expect(appended.map((entry) => entry.data.reason)).toEqual([
+			"claude-sonnet-4-5 does not support server compaction",
+			"turned off by PI_CLAUDE_AUTH_SERVER_COMPACTION",
+		]);
+	});
+
+	it("records every fallback in a session entry", async () => {
+		const r: FakeRun = { events: withoutBlock(compactionEvents(undefined, "refusal")), payloads: [], options: [] };
+		expect(await handlers().session_before_compact[0](event(), ctx(r))).toBeUndefined();
+		expect(appended).toEqual([
+			{
+				customType: FALLBACK_ENTRY_TYPE,
+				data: {
+					reason: "refusal",
+					stopReason: "refusal",
+					model: "claude-haiku-5-5",
+					trigger: "manual",
+					firstKeptEntryId: "u2",
+					tokensBefore: 1234,
+				},
+			},
+		]);
+		appended.length = 0;
+		forgetAgentRequests();
+		const c = ctx(r);
+		forgetAgentRequests();
+		expect(await handlers().session_before_compact[0](event(), c)).toBeUndefined();
+		expect(appended[0].data.reason).toContain("no earlier request");
+		expect(c.notices[0]).toContain("no earlier request");
 	});
 });
