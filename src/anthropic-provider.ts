@@ -137,7 +137,11 @@ function mergeServerCompactionOptions<T extends StreamOptions>(
 				);
 			}
 			try {
-				const systemTextPlacement = applyServerCompactionPayload(current, { auth });
+				const compat = (model as { compat?: { supportsMidConvoSystemMessages?: boolean } }).compat;
+				const systemTextPlacement = applyServerCompactionPayload(current, {
+					auth,
+					midConvoSystem: compat?.supportsMidConvoSystemMessages === true,
+				});
 				const updated = finish?.(current, systemTextPlacement);
 				if (updated) return updated;
 				if (!finish) return current;

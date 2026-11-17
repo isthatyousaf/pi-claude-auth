@@ -377,7 +377,7 @@ describe("server compaction through the provider", () => {
 		expect(toolNames(next)).toContain("two");
 	});
 
-	it("sends Pi's tools as they are when they differ from what the compaction request ended with [fallbacks: tools]", async () => {
+	it("sends Pi's summary text and tools when Pi's tools differ from the block's end state [round 1, finding 1]", async () => {
 		const change = { type: "message", id: "tc", message: { role: "system", content: "", toolsAdded: [tool("two")], timestamp: clock++ } };
 		const branch = chain(sys("s", [tool("one")]), user("u1"), assistant("a1"), change, user("u2"), assistant("a2"), user("u3"));
 		await agentRequest(await sessionRequest(branch));
@@ -388,6 +388,47 @@ describe("server compaction through the provider", () => {
 		});
 		const next = await agentRequest(await sessionRequest(after));
 		expect(toolNames(next)).toContain("three");
+		// The block would bring "two" back; Pi's summary text goes out instead.
+		expect(next.messages[0].role).toBe("user");
+		expect(JSON.stringify(next.messages)).not.toContain('"compaction"');
+		expect(JSON.stringify(next.messages)).toContain("Summary 1");
+		expect(JSON.stringify(next.messages)).not.toContain(ANCHOR_TEXT);
+		expect(betaHeaders.at(-1)).not.toContain("compact-2026-09-04");
+	});
+
+	it("sends no inline-tools beta on a model where pi-ai declares tools up front [round 1, finding 4]", async () => {
+		const older = runtime.getModels("anthropic").find((m) => m.id === "claude-sonnet-4-6");
+		if (!older) throw new Error("claude-sonnet-4-6 missing from the catalog");
+		model = older;
+		const branch = chain(sys("s"), user("u1"), assistant("a1"), user("u2"), assistant("a2"), user("u3"));
+		await agentRequest(await sessionRequest(branch));
+		expect(await compact(branch, "u2")).toBeDefined();
+		const body = compactionBodies()[0];
+		expect(betaHeaders[bodies.indexOf(body)]).toContain("compact-2026-09-04");
+		expect(betaHeaders[bodies.indexOf(body)]).not.toContain("inline-tools-2026-09-15");
+	});
+
+	it("keeps the reply to the last request as the first kept message after a prompt update at its end [round 1, finding 3]", async () => {
+		const update = { type: "message", id: "su", message: { role: "system", content: "", sections: { rules: "New rule." }, timestamp: clock++ } };
+		const branch = chain(sys("s"), user("u1"), assistant("a1"), user("u2"), assistant("a2"), update, user("u3"), assistant("a3"));
+		// The last request is the one that produced a3.
+		await agentRequest((await sessionRequest(branch)).slice(0, -1));
+		const result = await compact(branch, "u2");
+		expect(result?.compaction.firstKeptEntryId).toBe("a3");
+		const [body] = compactionBodies();
+		expect(JSON.stringify(body.messages)).toContain("New rule.");
+		expect(JSON.stringify(body.messages)).toContain("prompt u3");
+	});
+
+	it("treats an sk-ant-usr key as an API key [round 1, auth prefix]", async () => {
+		apiKey = "sk-ant-usr01-test-key";
+		const branch = chain(sys("s"), user("u1"), assistant("a1"), user("u2"), assistant("a2"), user("u3"));
+		const agentBody = await agentRequest(await sessionRequest(branch));
+		expect(JSON.stringify(agentBody.system)).toContain(SYSTEM_TEXT);
+		expect(JSON.stringify(agentBody.system)).not.toContain("cc_version");
+		const result = await compact(branch, "u2");
+		expect(result?.compaction.details).toMatchObject({ requestAuth: "api-key" });
+		expect(JSON.stringify(compactionBodies()[0].system)).not.toContain("cc_version");
 	});
 
 	it("falls back when tools changed and pi-ai declares them up front [finding 2]", async () => {
@@ -437,14 +478,31 @@ describe("server compaction through the provider", () => {
 		expect(result?.compaction.details).toMatchObject({ requestAuth: "api-key", requestSystem: compactionBody.system });
 
 		// Pi's compaction folds the update into the leading system message.
-		const after = appendCompaction(branch, result as never, "c1", {
+		const compacted = appendCompaction(branch, result as never, "c1", {
 			role: "system", content: SYSTEM_TEXT + " Updated.", toolsAdded: [tool("read"), tool("codemode")], timestamp: clock++,
 		});
+		const [u4] = chain(user("u4"));
+		(u4 as { parentId: string }).parentId = "c1";
+		const after = [...compacted, u4];
 		const next = await agentRequest(await sessionRequest(after));
 		expect(stripCache(next.system)).toEqual(stripCache(compactionBody.system));
 		expect(next.messages[0]).toMatchObject({ role: "assistant", content: [{ type: "compaction" }] });
-		expect(JSON.stringify(next.messages)).toContain("Updated.");
 		expect(JSON.stringify(next.messages)).not.toContain(ANCHOR_TEXT);
+		// The changed prompt is a system message after the kept turns and the new user turn [round 1, finding 2].
+		const texts = next.messages.map((m: Body) => m.role + ":" + JSON.stringify(m.content));
+		const updateAt = texts.findIndex((t: string) => t.startsWith("system:") && t.includes("Updated."));
+		const prompt = texts.findIndex((t: string) => t.includes("prompt u4"));
+		expect(updateAt).toBeGreaterThan(prompt);
+		expect(prompt).toBeGreaterThan(texts.findIndex((t: string) => t.includes("prompt u3")));
+		expect(texts.filter((t: string) => t.startsWith("user:") && t.includes("Updated."))).toEqual([]);
+		// It stays at the same place on the next request.
+		const [a4] = chain(assistant("a4"));
+		(a4 as { parentId: string }).parentId = "u4";
+		const later = await agentRequest(await sessionRequest([...after, a4]));
+		const laterTexts = later.messages.map((m: Body) => m.role + ":" + JSON.stringify(m.content));
+		expect(laterTexts.slice(0, updateAt + 1).map((t: string) => t.replace(/,"cache_control":\{[^}]*\}/g, ""))).toEqual(
+			texts.slice(0, updateAt + 1).map((t: string) => t.replace(/,"cache_control":\{[^}]*\}/g, "")),
+		);
 	});
 
 	it("falls back when the cut separates two user messages [finding 3]", async () => {

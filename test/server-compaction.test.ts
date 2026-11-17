@@ -44,7 +44,7 @@ const BLOCK: CompactionBlock = {
 	type: "compaction",
 	content: "## Goal\nPlan the release.",
 	signature: "sig-abc",
-	tool_changes: [{ kind: "kept-as-is" }],
+	future_field: [{ kind: "kept-as-is" }],
 };
 
 const anchorMessage = () => ({
@@ -115,31 +115,89 @@ describe("applyServerCompactionPayload", () => {
 		]);
 		expect(applyServerCompactionPayload(p)).toBe("anchor");
 		expect(p.messages[0]).toEqual({ role: "assistant", content: [BLOCK] });
-		// The block records tool changes, so the inline-tools beta goes with it.
-		expect(p.betas).toEqual(["oauth-2025-04-20", COMPACT_BETA, INLINE_TOOLS_BETA]);
-	});
-
-	it("adds only the compaction beta for a block without tool changes", () => {
-		const plain = { ...BLOCK, content: "plain", tool_changes: undefined };
-		rememberCompactionBlock(plain.content, plain);
-		const p = payload([{ role: "user", content: [{ type: "text", text: summaryMessageText("plain") }] }]);
-		applyServerCompactionPayload(p);
+		// pi-ai adds the inline-tools beta itself; the compaction transform does not.
 		expect(p.betas).toEqual(["oauth-2025-04-20", COMPACT_BETA]);
 	});
 
-	it("restores the compaction request's tools only when Pi's tools are what that request ended with", () => {
+	describe("tools of a block with recorded tool changes [round 1, findings 1 and 4]", () => {
 		const one = { name: "one", input_schema: {} };
 		const two = { name: "two", input_schema: {} };
+		const three = { name: "three", input_schema: {} };
 		const placeholder = { name: "__pi_deferred_placeholder__", defer_loading: true };
-		rememberCompactionBlock(BLOCK.content, BLOCK, { requestTools: [one, placeholder], effectiveTools: [one, two] });
-		const upFront = payload([summaryMessage()]);
-		upFront.tools = [{ ...one, cache_control: { type: "ephemeral" } }, two, placeholder];
-		applyServerCompactionPayload(upFront);
-		expect(upFront.tools).toEqual([one, placeholder]);
-		const other = payload([summaryMessage()]);
-		other.tools = [one, { name: "three", input_schema: {} }, placeholder];
-		applyServerCompactionPayload(other);
-		expect(other.tools).toEqual([one, { name: "three", input_schema: {} }, placeholder]);
+		const changed = { ...BLOCK, content: "changed", tool_changes: [{ type: "tool_addition", name: "two" }] };
+		const summary = () => ({ role: "user", content: [{ type: "text", text: summaryMessageText("changed") }] });
+		const request = (tools: unknown[], betas = ["oauth-2025-04-20", INLINE_TOOLS_BETA]) => {
+			const p = payload([summary(), anchorMessage(), { role: "user", content: [{ type: "text", text: "new" }] }]);
+			p.tools = tools;
+			p.betas = betas;
+			return p;
+		};
+		beforeEach(() => {
+			rememberCompactionBlock(changed.content, changed, { requestTools: [one, placeholder], effectiveTools: [one, two] });
+		});
+
+		it("sends the compaction request's tools when Pi's tools are the block's end state", () => {
+			const p = request([{ ...one, cache_control: { type: "ephemeral" } }, two, placeholder]);
+			expect(applyServerCompactionPayload(p)).toBe("anchor");
+			expect(p.messages[0].content[0]).toMatchObject({ type: "compaction", signature: "sig-abc" });
+			expect(p.tools).toEqual([one, placeholder]);
+		});
+
+		for (const [name, tools] of [
+			["a tool Pi dropped", [one, placeholder]],
+			["a tool Pi added up front", [one, two, three, placeholder]],
+			["a recorded removal of a tool Pi redefined", [one, { ...two, description: "new" }, placeholder]],
+		] as const) {
+			it("sends Pi's summary text instead of the block for " + name, () => {
+				const p = request([...tools]);
+				expect(applyServerCompactionPayload(p)).toBe("first-user");
+				expect(p.messages[0]).toEqual(summary());
+				expect(p.tools).toEqual(tools);
+				expect(JSON.stringify(p.messages)).not.toContain(ANCHOR_TEXT);
+				expect(p.betas).not.toContain(COMPACT_BETA);
+			});
+		}
+
+		it("sends Pi's summary text when the request lacks the inline-tools beta", () => {
+			const p = request([one, two, placeholder], ["oauth-2025-04-20"]);
+			expect(applyServerCompactionPayload(p)).toBe("first-user");
+			expect(p.messages[0]).toEqual(summary());
+		});
+
+		it("never adds the inline-tools beta to a compaction request", () => {
+			const p = payload([{ role: "user", content: "u" }]);
+			markCompactionRequestPayload(p);
+			applyServerCompactionPayload(p);
+			expect(p.betas).toEqual(["oauth-2025-04-20", COMPACT_BETA]);
+		});
+	});
+
+	it("keeps Pi's system on API-key requests to models without mid-conversation system messages [round 1, finding 2]", () => {
+		const requestSystem = [{ type: "text", text: "Old prompt." }];
+		rememberCompactionBlock(BLOCK.content, BLOCK, { requestAuth: "api-key", requestSystem });
+		const make = () => {
+			const p = payload([summaryMessage(), anchorMessage(), { role: "user", content: [{ type: "text", text: "new" }] }]);
+			p.system = [{ type: "text", text: "New prompt." }];
+			return p;
+		};
+		const without = make();
+		applyServerCompactionPayload(without, { auth: "api-key", midConvoSystem: false });
+		expect(without.system).toEqual([{ type: "text", text: "New prompt." }]);
+		const withSystem = make();
+		applyServerCompactionPayload(withSystem, { auth: "api-key", midConvoSystem: true });
+		expect(withSystem.system).toEqual(requestSystem);
+		expect(withSystem.messages.map((m: { role: string }) => m.role)).toEqual(["assistant", "user", "user", "system"]);
+		expect(JSON.stringify(withSystem.messages[3])).toContain("New prompt.");
+	});
+
+	it("sends the compaction request's tools in its order when Pi holds the same tools [round 1, finding 5]", () => {
+		const one = { name: "one", input_schema: {} };
+		const two = { name: "two", input_schema: {} };
+		rememberCompactionBlock(BLOCK.content, BLOCK, { requestTools: [one, two], effectiveTools: [one, two] });
+		const p = payload([summaryMessage()]);
+		p.tools = [two, { ...one, cache_control: { type: "ephemeral" } }];
+		applyServerCompactionPayload(p);
+		expect(p.tools).toEqual([one, two]);
 	});
 
 	it("applies inline tool changes in order", () => {
@@ -665,6 +723,23 @@ describe("buildCompactionRequestMessages", () => {
 		expect(build(late, "a2")).toMatchObject({ ok: true });
 		const early = entries(sys("s"), user("u1"), update, assistant("a1"), user("u2"), assistant("a2"));
 		expect(build(early, "u2")).toMatchObject({ ok: true });
+	});
+
+	it("keeps the reply to the last request after a prompt update at its end [round 1, finding 3]", () => {
+		const update = {
+			type: "message", id: "su",
+			message: { role: "system", content: "", sections: { b: "More." }, timestamp: clock++ },
+		};
+		const branch = entries(sys("s"), user("u1"), assistant("a1"), user("u2"), assistant("a2"), update, user("u3"), assistant("a3"));
+		const request = agentRequest(branch).slice(0, -1);
+		const result = build(branch, "a3", request);
+		expect(result).toMatchObject({ ok: true });
+		if (!result.ok) throw new Error("expected a request");
+		expect(result.messages).toEqual(request);
+		const projection = buildSessionProjection(branch);
+		expect(moveCutPastSystemChanges(projection, "u2", (id) => build(branch, id, request))?.firstKeptEntryId).toBe("a3");
+		// A kept user message still cannot follow the update.
+		expect(build(branch, "u3", request)).toEqual({ ok: false, reason: KEPT_SYSTEM_CHANGE });
 	});
 
 	it("accepts tool changes in the summarized part only when pi-ai declares them inline", () => {

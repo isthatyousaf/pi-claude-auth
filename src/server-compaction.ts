@@ -354,22 +354,40 @@ function hasRecordedToolChanges(block: CompactionBlock): boolean {
 	return Array.isArray(changes) ? changes.length > 0 : changes !== undefined && changes !== null;
 }
 
+function hasBeta(payload: WirePayload, beta: string): boolean {
+	return Array.isArray(payload.betas) && (payload.betas as unknown[]).includes(beta);
+}
+
 /**
- * After Pi's compaction the leading system message declares every tool, the
- * ones added since the start included. The block records those additions
- * itself and the API applies them, so the request-level tools must stay those
- * of the compaction request. Restored only when Pi's tools are exactly what
- * that request ended with; otherwise the request goes out as Pi built it.
- * Returns whether `tools` now equal the compaction request's.
+ * Fit the request-level tools to the block. After Pi's compaction the leading
+ * system message declares every tool, the ones added since the start
+ * included, while the compaction request declared the starting tools and the
+ * changes inline.
+ *
+ * - A block with recorded `tool_changes` has the API apply them on every
+ *   request that carries it, so the request must declare the compaction
+ *   request's tools, send the inline-tools beta, and mean the tools the block
+ *   ends with. When Pi's tools are not exactly those, or the beta is missing,
+ *   the API would bring back a tool Pi dropped or reference one it no longer
+ *   declares (a 400 on every request), so the block is not carried: returns
+ *   false, and Pi's summary text goes out instead.
+ * - Without recorded changes Pi's tools are the compaction request's whenever
+ *   they hold the same tools, and are sent in that request's order.
  */
-function restoreCompactionTools(p: WirePayload, known: KnownCompaction): boolean {
-	if (!known.requestTools || !known.effectiveTools || !Array.isArray(p.tools)) return false;
-	const current = toolsKey(p.tools);
-	if (current === toolsKey(known.requestTools)) return true;
-	if (current !== toolsKey(known.effectiveTools)) {
-		log("server_compaction_tools_differ", {});
-		return false;
+function fitCompactionTools(p: WirePayload, known: KnownCompaction): boolean {
+	if (!hasRecordedToolChanges(known.block)) {
+		if (known.requestTools && Array.isArray(p.tools) && toolsKey(p.tools) === toolsKey(known.requestTools))
+			p.tools = structuredClone(known.requestTools);
+		return true;
 	}
+	if (
+		!known.requestTools ||
+		!known.effectiveTools ||
+		!Array.isArray(p.tools) ||
+		!hasBeta(p, INLINE_TOOLS_BETA) ||
+		toolsKey(p.tools) !== toolsKey(known.effectiveTools)
+	)
+		return false;
 	p.tools = structuredClone(known.requestTools);
 	return true;
 }
@@ -383,51 +401,63 @@ function systemText(system: unknown): string {
 		.join("\n\n");
 }
 
-/** Text an API-key request puts at the anchor when the system prompt changed. */
+/** Text of the system message an API-key request adds when the system prompt changed. */
 export function systemPromptUpdateText(text: string): string {
-	return `The system prompt changed after the conversation above was summarized. The current system prompt follows; where it differs from the one at the start, follow this one.\n\n<system-prompt>\n${text}\n</system-prompt>`;
+	return `The system prompt changed after the conversation above was summarized. The current system prompt follows and replaces the one at the start of the conversation.\n\n<system-prompt>\n${text}\n</system-prompt>`;
 }
 
-function findAnchorBlock(messages: unknown): { content: WireBlock[]; index: number } | undefined {
-	if (!Array.isArray(messages)) return undefined;
-	for (const message of messages as WireMessage[]) {
-		if (!Array.isArray(message?.content)) continue;
-		const index = message.content.findIndex(isAnchorBlock);
-		if (index >= 0) return { content: message.content, index };
-	}
-	return undefined;
+/**
+ * Index after the user turn that holds the anchor: the API reads consecutive
+ * user messages as one turn. -1 without an anchor.
+ */
+function afterAnchorTurn(messages: WireMessage[]): number {
+	const at = messages.findIndex(
+		(message) => Array.isArray(message?.content) && message.content.some(isAnchorBlock),
+	);
+	if (at < 0) return -1;
+	let end = at + 1;
+	while (messages[end]?.role === "user") end++;
+	return end;
 }
 
 /**
  * API-key requests keep Pi's prompt in `system`, and Pi rewrites it at its
  * compaction with every section update made before. The kept thinking needs
- * the `system` of the compaction request, so that one is sent again, and a
- * changed prompt goes to the anchor, after the kept turns. Without an anchor
- * an agent request keeps Pi's `system`.
+ * the `system` of the compaction request, so that one is sent again. A
+ * changed prompt goes into a `system` message right after the user turn that
+ * holds the anchor, where Anthropic's docs put restated instructions: after
+ * the kept turns and the next user message, with system priority.
+ *
+ * Pi's `system` stays when the model takes no mid-conversation system
+ * messages, and on an agent request without an anchor. A compaction request
+ * without an anchor drops the changed text, as for OAuth.
  */
 function placeSystemForApiKey(
 	p: WirePayload,
 	known: KnownCompaction,
 	compactionRequest: boolean,
+	midConvoSystem: boolean,
 ): void {
 	if (known.requestAuth !== "api-key" || known.requestSystem === undefined) return;
 	const current = JSON.stringify(p.system ?? null, withoutCacheControl);
 	if (current === JSON.stringify(known.requestSystem, withoutCacheControl)) return;
-	const anchor = findAnchorBlock(p.messages);
-	if (!anchor && !compactionRequest) {
+	if (!midConvoSystem) {
+		log("server_compaction_system_changed_without_system_messages", {});
+		return;
+	}
+	const messages = p.messages as WireMessage[];
+	const at = afterAnchorTurn(messages);
+	if (at < 0 && !compactionRequest) {
 		log("server_compaction_system_changed_without_anchor", {});
 		return;
 	}
 	const text = systemText(p.system);
 	p.system = structuredClone(known.requestSystem);
-	if (anchor && text.length > 0) {
-		const cacheControl = anchor.content[anchor.index].cache_control;
-		anchor.content[anchor.index] = {
-			type: "text",
-			text: systemPromptUpdateText(text),
-			...(cacheControl !== undefined ? { cache_control: cacheControl } : {}),
-		};
-	}
+	if (at >= 0 && text.length > 0)
+		messages.splice(at, 0, {
+			role: "system",
+			content: [{ type: "text", text: systemPromptUpdateText(text) }],
+		});
 }
 
 /**
@@ -439,13 +469,12 @@ function placeSystemForApiKey(
 function stashCompactionDeclarations(
 	p: WirePayload,
 	known: KnownCompaction | undefined,
-	toolsRestored: boolean,
 	auth: RequestAuth | undefined,
 ): void {
 	const requestTools = Array.isArray(p.tools) ? (structuredClone(p.tools) as unknown[]) : undefined;
-	let start: readonly unknown[] | undefined;
-	if (!known || !hasRecordedToolChanges(known.block)) start = requestTools;
-	else if (toolsRestored) start = known.effectiveTools;
+	// A carried block with recorded changes passed fitCompactionTools.
+	const start =
+		known && hasRecordedToolChanges(known.block) ? known.effectiveTools : requestTools;
 	compactionRequestDeclarations.set(p, {
 		...(auth ? { requestAuth: auth } : {}),
 		...(requestTools ? { requestTools } : {}),
@@ -467,7 +496,8 @@ function stashCompactionDeclarations(
  *   marker pi-ai put before it is dropped: the API forbids a `system` message
  *   as the first kept message.
  * - The request-level tools of the compaction request are sent again
- *   ({@link restoreCompactionTools}).
+ *   ({@link fitCompactionTools}); when they cannot be, Pi's summary text stays
+ *   in place of the block.
  * - With a block, the OAuth system text goes to the anchor. A compaction
  *   request without an anchor drops it: adding the text to a summarized
  *   message would change the prefix the kept thinking was produced with.
@@ -477,7 +507,11 @@ function stashCompactionDeclarations(
  */
 export function applyServerCompactionPayload(
 	payload: unknown,
-	options: { auth?: RequestAuth } = {},
+	options: {
+		auth?: RequestAuth;
+		/** Whether the model takes `role: "system"` messages in `messages`. */
+		midConvoSystem?: boolean;
+	} = {},
 ): SystemTextPlacement {
 	if (!payload || typeof payload !== "object") return "first-user";
 	const p = payload as WirePayload;
@@ -487,16 +521,21 @@ export function applyServerCompactionPayload(
 
 	const first = messages[0];
 	const summaryText = first?.role === "user" ? messageText(first) : undefined;
-	const known =
+	let known =
 		serverCompactionEnabled() && supportsServerCompaction(p.model) && summaryText !== undefined
 			? blocksBySummaryText.get(summaryText)
 			: undefined;
+	if (known && !fitCompactionTools(p, known)) {
+		log("server_compaction_block_not_sent", { reason: "tools differ from the block's" });
+		known = undefined;
+	}
+	// pi-ai sends the inline-tools beta itself when it declares tool changes
+	// inline; the block then records them.
 	if (!known) {
 		stripAnchors(p);
 		if (compactionRequest) {
 			addBeta(p, COMPACT_BETA);
-			addBeta(p, INLINE_TOOLS_BETA);
-			stashCompactionDeclarations(p, undefined, false, options.auth);
+			stashCompactionDeclarations(p, undefined, options.auth);
 		}
 		return "first-user";
 	}
@@ -514,8 +553,6 @@ export function applyServerCompactionPayload(
 	if (isEffortMarker(messages[1]) && messages[2]?.role === "assistant")
 		messages.splice(1, 1);
 	addBeta(p, COMPACT_BETA);
-	if (compactionRequest || hasRecordedToolChanges(known.block)) addBeta(p, INLINE_TOOLS_BETA);
-	const toolsRestored = restoreCompactionTools(p, known);
 
 	const anchors: Array<{ message: number; block: number }> = [];
 	messages.forEach((message, i) => {
@@ -536,8 +573,9 @@ export function applyServerCompactionPayload(
 		moveAnchorPastToolResults(messages, anchors[0].message);
 		placement = "anchor";
 	}
-	if (options.auth === "api-key") placeSystemForApiKey(p, known, compactionRequest);
-	if (compactionRequest) stashCompactionDeclarations(p, known, toolsRestored, options.auth);
+	if (options.auth === "api-key")
+		placeSystemForApiKey(p, known, compactionRequest, options.midConvoSystem === true);
+	if (compactionRequest) stashCompactionDeclarations(p, known, options.auth);
 	return placement;
 }
 
@@ -1136,15 +1174,19 @@ export function buildCompactionRequestMessages(options: {
 	)
 		return fail("the session changed since the last request");
 
-	const firstKeptAssistant = !anchorKept && firstKept?.role === "assistant" ? keptIndex : -1;
+	// Where the first kept reply is in the request; the reply to the request
+	// itself (not in it) counts as right after its end.
+	const firstKeptAssistant =
+		!anchorKept && firstKept?.role === "assistant" ? (keptIndex >= 0 ? keptIndex : request.length) : -1;
 	for (let i = 1; i < request.length; i++) {
 		const message = request[i];
 		if (!changesSystem(message)) continue;
 		if (changesTools(message) && !options.nativeToolChanges)
 			return fail("tools changed during the session");
 		if (i >= cutIndex) return fail(KEPT_SYSTEM_CHANGE);
-		const next = request.findIndex((m, j) => j > i && m.role === "assistant" && isSent(m));
-		if (next >= 0 && (next < cutIndex || next === firstKeptAssistant)) continue;
+		const found = request.findIndex((m, j) => j > i && m.role === "assistant" && isSent(m));
+		const next = found < 0 ? request.length : found;
+		if (next < cutIndex || next === firstKeptAssistant) continue;
 		return fail(KEPT_SYSTEM_CHANGE);
 	}
 

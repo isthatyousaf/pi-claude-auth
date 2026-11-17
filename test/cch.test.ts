@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { patchClaudeCodeCch, xxHash64 } from "../src/cch.ts";
+import { isAnthropicOAuthToken, patchClaudeCodeCch, xxHash64 } from "../src/cch.ts";
 import { injectBillingHeader } from "../src/transforms.ts";
 
 const encoder = new TextEncoder();
@@ -14,6 +14,15 @@ describe("xxHash64", () => {
 		expect(xxHash64(encoder.encode("hello")).toString(16)).toBe(
 			"26c7827d889f6da3",
 		);
+	});
+});
+
+describe("isAnthropicOAuthToken", () => {
+	it("treats only sk-ant-oat tokens as OAuth", () => {
+		expect(isAnthropicOAuthToken("sk-ant-oat01-x")).toBe(true);
+		expect(isAnthropicOAuthToken("sk-ant-usr01-x")).toBe(false);
+		expect(isAnthropicOAuthToken("sk-ant-api03-x")).toBe(false);
+		expect(isAnthropicOAuthToken(undefined)).toBe(false);
 	});
 });
 
