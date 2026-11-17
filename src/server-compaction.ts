@@ -400,7 +400,7 @@ function fitCompactionTools(p: WirePayload, known: KnownCompaction): boolean {
  * current breakpoint moves to the same distance from the end.
  */
 function restoreTools(current: unknown[], saved: unknown[]): unknown[] {
-	const restored = withoutCacheControlValue(saved) as WireTool[];
+	const restored = (structuredClone(saved) as WireTool[]).map(({ cache_control: _, ...tool }) => tool);
 	current.forEach((tool, i) => {
 		const cacheControl = (tool as WireTool | undefined)?.cache_control;
 		const j = restored.length - (current.length - i);
