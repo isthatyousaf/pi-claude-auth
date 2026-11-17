@@ -309,8 +309,25 @@ export function compactionDeclarationsOf(payload: object): CompactionDeclaration
 	return compactionRequestDeclarations.get(payload);
 }
 
-function withoutCacheControlValue<T>(value: T): T {
-	return JSON.parse(JSON.stringify(value, withoutCacheControl)) as T;
+/**
+ * Anthropic cache breakpoints sit on the top level of a tool, a system block or
+ * a message content block. Fields of the same name deeper down (a tool
+ * parameter called `cache_control`, say) are content and stay.
+ */
+function withoutCacheControl<T>(value: T): T {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+	const { cache_control: _, ...rest } = value as Record<string, unknown>;
+	return rest as T;
+}
+
+function blocksWithoutCacheControl(value: unknown): unknown {
+	return Array.isArray(value) ? value.map(withoutCacheControl) : value;
+}
+
+function messageWithoutCacheControl(message: unknown): unknown {
+	if (!message || typeof message !== "object") return message;
+	const m = message as WireMessage;
+	return Array.isArray(m.content) ? { ...m, content: m.content.map(withoutCacheControl) } : m;
 }
 
 type WireTool = { name?: unknown } & Record<string, unknown>;
@@ -320,7 +337,7 @@ export function toolsKey(tools: unknown): string {
 	if (!Array.isArray(tools)) return "null";
 	const list = (tools as WireTool[])
 		.filter((tool) => tool?.name !== DEFERRED_TOOL_PLACEHOLDER_NAME)
-		.map((tool) => JSON.stringify(tool, withoutCacheControl))
+		.map((tool) => JSON.stringify(withoutCacheControl(tool)))
 		.sort();
 	return JSON.stringify(list);
 }
@@ -333,7 +350,7 @@ export function applyInlineToolChanges(tools: readonly unknown[], messages: unkn
 	const byName = new Map<string, unknown>();
 	for (const tool of tools as WireTool[]) {
 		if (tool?.name !== DEFERRED_TOOL_PLACEHOLDER_NAME)
-			byName.set(String(tool?.name), withoutCacheControlValue(tool));
+			byName.set(String(tool?.name), withoutCacheControl(structuredClone(tool)));
 	}
 	if (Array.isArray(messages)) {
 		for (const message of messages as WireMessage[]) {
@@ -342,7 +359,7 @@ export function applyInlineToolChanges(tools: readonly unknown[], messages: unkn
 				const tool = block.tool as { name?: unknown; definition?: WireTool } | undefined;
 				if (block.type === "tool_removal" && tool?.name !== undefined) byName.delete(String(tool.name));
 				if (block.type === "tool_addition" && tool?.definition?.name !== undefined)
-					byName.set(String(tool.definition.name), withoutCacheControlValue(tool.definition));
+					byName.set(String(tool.definition.name), withoutCacheControl(structuredClone(tool.definition)));
 			}
 		}
 	}
@@ -400,7 +417,7 @@ function fitCompactionTools(p: WirePayload, known: KnownCompaction): boolean {
  * current breakpoint moves to the same distance from the end.
  */
 function restoreTools(current: unknown[], saved: unknown[]): unknown[] {
-	const restored = (structuredClone(saved) as WireTool[]).map(({ cache_control: _, ...tool }) => tool);
+	const restored = (structuredClone(saved) as WireTool[]).map(withoutCacheControl);
 	current.forEach((tool, i) => {
 		const cacheControl = (tool as WireTool | undefined)?.cache_control;
 		const j = restored.length - (current.length - i);
@@ -457,8 +474,8 @@ function placeSystemForApiKey(
 	midConvoSystem: boolean,
 ): void {
 	if (known.requestAuth !== "api-key" || known.requestSystem === undefined) return;
-	const current = JSON.stringify(p.system ?? null, withoutCacheControl);
-	if (current === JSON.stringify(known.requestSystem, withoutCacheControl)) return;
+	const current = JSON.stringify(blocksWithoutCacheControl(p.system ?? null));
+	if (current === JSON.stringify(blocksWithoutCacheControl(known.requestSystem))) return;
 	if (!midConvoSystem) {
 		log("server_compaction_system_changed_without_system_messages", {});
 		return;
@@ -698,10 +715,6 @@ export function isAgentPayload(payload: unknown): boolean {
 	return !!payload && typeof payload === "object" && agentPayloads.has(payload);
 }
 
-function withoutCacheControl(_key: string, value: unknown): unknown {
-	return _key === "cache_control" ? undefined : value;
-}
-
 /**
  * Declarations a compaction request must share with the agent requests around
  * it. Cache breakpoints are left out: they do not change the prompt, and the
@@ -709,7 +722,10 @@ function withoutCacheControl(_key: string, value: unknown): unknown {
  */
 export function payloadDeclarationsKey(payload: unknown): string {
 	const p = (payload ?? {}) as WirePayload;
-	return JSON.stringify({ tools: p.tools ?? null, system: p.system ?? null }, withoutCacheControl);
+	return JSON.stringify({
+		tools: blocksWithoutCacheControl(p.tools ?? null),
+		system: blocksWithoutCacheControl(p.system ?? null),
+	});
 }
 
 export function wireMessageRecords(payload: unknown): WireMessageRecord[] {
@@ -717,7 +733,7 @@ export function wireMessageRecords(payload: unknown): WireMessageRecord[] {
 	if (!Array.isArray(messages)) return [];
 	return messages.map((message: WireMessage) => ({
 		role: String(message?.role),
-		key: JSON.stringify(message, withoutCacheControl),
+		key: JSON.stringify(messageWithoutCacheControl(message)),
 	}));
 }
 
@@ -789,7 +805,7 @@ export function wirePrefixMismatch(
 ): string | undefined {
 	if (sent.length > recorded.length) return "the compaction request outgrows the last request";
 	for (let i = 0; i < sent.length; i++) {
-		if (JSON.stringify(sent[i], withoutCacheControl) !== recorded[i].key)
+		if (JSON.stringify(messageWithoutCacheControl(sent[i])) !== recorded[i].key)
 			return "the compaction request differs from the last request";
 	}
 	const last = sent.at(-1) as WireMessage | undefined;

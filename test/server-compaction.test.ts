@@ -231,6 +231,20 @@ describe("applyServerCompactionPayload", () => {
 		expect(p.tools).toEqual([tool("one"), { ...tool("two"), cache_control: { type: "ephemeral", ttl: "1h" } }]);
 	});
 
+	it("treats a changed tool parameter named cache_control as a different tool", () => {
+		const tool = (type: string) => ({
+			name: "one",
+			input_schema: { type: "object", properties: { cache_control: { type } }, required: ["cache_control"] },
+		});
+		expect(toolsKey([tool("string")])).not.toBe(toolsKey([tool("object")]));
+		expect(toolsKey([{ ...tool("string"), cache_control: { type: "ephemeral" } }])).toBe(toolsKey([tool("string")]));
+		rememberCompactionBlock(BLOCK.content, BLOCK, { requestTools: [tool("string")] });
+		const p = payload([summaryMessage()]);
+		p.tools = [tool("object")];
+		applyServerCompactionPayload(p);
+		expect(p.tools).toEqual([tool("object")]);
+	});
+
 	it("restores tools after recorded tool changes with the current cache breakpoint", () => {
 		const def = (name: string) => ({ name, input_schema: {} });
 		const placeholder = { name: "__pi_deferred_placeholder__" };
